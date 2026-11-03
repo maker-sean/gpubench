@@ -51,6 +51,30 @@ def sh(cmd, timeout=60):
         return f"ERROR: {e}"
 
 
+STAMP_FILE = ".gpubench_instance_start"
+
+
+def resolve_instance_start(arg):
+    """Unix time at which this GPU started costing money.
+
+    Order of preference: the --instance-start you pass (when you clicked deploy, the
+    only truthful answer), then the stamp setup.sh wrote when it first ran on the box
+    (a lower bound: it misses provisioning, boot and image pull), then nothing.
+    """
+    if arg:
+        try:
+            return float(arg)
+        except ValueError:
+            return datetime.fromisoformat(arg.replace("Z", "+00:00")).timestamp()
+    for q in (Path(STAMP_FILE), Path.home() / STAMP_FILE):
+        if q.exists():
+            try:
+                return float(q.read_text().strip())
+            except (ValueError, OSError):
+                pass
+    return None
+
+
 def smi_target(gpu):
     """The nvidia-smi selector for torch device index `gpu`.
 
@@ -227,6 +251,8 @@ def summarize_telemetry(path):
         "sm_mhz_min": min(sm) if sm else None,
         "power_w_mean": statistics.mean(power) if power else None,
         "temp_c_max": max(temp) if temp else None,
+        "temp_c_first": temp[0] if temp else None,
+        "temp_c_last": temp[-1] if temp else None,
         "throttle_fraction": {k: v / n for k, v in flags.items()},
     }
 
@@ -327,6 +353,7 @@ class Inference:
 # ----------------------------------------------------------------------------- commands
 
 def cmd_run(args):
+    t_proc = time.time()
     import torch
     assert torch.cuda.is_available(), "No CUDA device visible"
     torch.cuda.set_device(args.gpu)
@@ -338,19 +365,29 @@ def cmd_run(args):
     out = Path(args.out) / args.provider / f"{stamp}_{uuid8}"
     out.mkdir(parents=True, exist_ok=True)
 
+    timings = {"instance_start": resolve_instance_start(args.instance_start),
+               "process_start": t_proc, "first_window": None}
     fp = fingerprint(args.gpu, target, args.provider, args.price_per_hr, args.label, out)
+    timings["fingerprint_done"] = time.time()
     print(f"[gpubench] {fp['gpu']['name']} | driver {fp['gpu']['driver_version']} | "
           f"power limit {fp['gpu']['power.limit']} of {fp['gpu']['power.default_limit']} W | "
           f"smi target {target} -> {out}")
 
-    results = {"repeats": []}
-    for r in range(0 if args.inference_only else args.repeats):
-        rep = {"repeat": r, "cold": r == 0}
+    results = {"repeats": [], "timings": timings}
+
+    def one_repeat(r, state):
+        rep = {"repeat": r, "cold": state == "cold", "cooled": state == "recooled",
+               "state": state}
         tpath = out / f"telemetry_gemm_r{r}.csv"
-        print(f"[gpubench] repeat {r}: GEMM for {args.gemm_seconds}s")
+        print(f"[gpubench] repeat {r} ({state}): GEMM for {args.gemm_seconds}s")
+        t0 = time.time()
         with Telemetry(tpath, target):
             rep["gemm"] = bench_gemm(args.gemm_seconds, args.gemm_n)
         rep["gemm"]["telemetry"] = summarize_telemetry(tpath)
+        rep["gemm"]["started_at"] = t0
+        if timings.get("first_window") is None:
+            # The first second of real measurement. Everything before this is overhead.
+            timings["first_window"] = t0 + (rep["gemm"]["window_seconds"] or [0])[0]
 
         tpath = out / f"telemetry_membw_r{r}.csv"
         print(f"[gpubench] repeat {r}: memory bandwidth")
@@ -360,6 +397,24 @@ def cmd_run(args):
         results["repeats"].append(rep)
         (out / "results.json").write_text(json.dumps(results, indent=2))
 
+    for r in range(0 if args.inference_only else args.repeats):
+        one_repeat(r, "cold" if r == 0 else "warm")
+
+    if args.cooldown and not args.inference_only:
+        # Repeat 0 is cold and first-ever, so it absorbs thermal state AND one-time
+        # software cost (cuBLAS autotune, first-touch allocation). Idling the card and
+        # running once more separates them: if this matches repeat 0 the penalty is
+        # thermal, if it matches the warm repeats it was software and happens once.
+        print(f"[gpubench] cooling down {args.cooldown} min, telemetry running")
+        tpath = out / "telemetry_idle.csv"
+        with Telemetry(tpath, target):
+            time.sleep(args.cooldown * 60)
+        results["cooldown"] = {"minutes": args.cooldown,
+                               "telemetry": summarize_telemetry(tpath)}
+        one_repeat(args.repeats, "recooled")
+
+    timings["gemm_done"] = time.time()
+
     if not args.skip_inference:
         # Inference runs in a fresh process, for two reasons. vLLM spawns its own
         # engine workers and can hang or abort when the parent already holds a CUDA
@@ -368,8 +423,25 @@ def cmd_run(args):
         # gpu_memory_utilization=0.85 actually means.
         results["inference"] = run_inference_subprocess(args, out, target)
 
+    timings["run_end"] = time.time()
+    if isinstance(results.get("inference"), list) and results["inference"]:
+        timings["model_ready"] = results["inference"][0].get("model_ready")
     (out / "results.json").write_text(json.dumps(results, indent=2))
+    o = overhead(timings)
+    if o is not None:
+        print(f"[gpubench] overhead before the first measured second: {o:.0f}s")
+    else:
+        print("[gpubench] no instance start recorded, overhead unknown. "
+              "Pass --instance-start next time or run setup.sh first.")
     print(f"[gpubench] done -> {out}")
+
+
+def overhead(t):
+    """Seconds of billed GPU time before the first measured second. None if unknown."""
+    if not t:
+        return None
+    a, b = t.get("instance_start"), t.get("first_window")
+    return b - a if a and b else None
 
 
 def run_inference_subprocess(args, out, target):
@@ -393,7 +465,11 @@ def cmd_inference(args):
     try:
         import torch
         torch.cuda.set_device(args.gpu)
+        t_load = time.time()
         inf = Inference(args.model)
+        model_ready = time.time()
+        print(f"[gpubench] model ready in {model_ready - t_load:.0f}s "
+              "(download plus load, billed GPU time)")
     except Exception as e:  # noqa: BLE001
         # A missing vLLM, a failed model download and an OOM all land here. Record
         # which one it was rather than losing the GEMM data to a traceback.
@@ -408,6 +484,8 @@ def cmd_inference(args):
         with Telemetry(tpath, args.smi_target):
             res = inf.run(args.prompts, args.max_tokens)
         res["repeat"] = r
+        res["model_load_s"] = model_ready - t_load
+        res["model_ready"] = model_ready
         res["telemetry"] = summarize_telemetry(tpath)
         res_list.append(res)
         (out / "inference.json").write_text(json.dumps(res_list, indent=2))
@@ -527,6 +605,110 @@ def med(xs):
     return statistics.median(xs) if xs else None
 
 
+T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+             8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 15: 2.131, 20: 2.086}
+
+
+def t_crit(df):
+    for k in sorted(T_CRIT_95):
+        if df <= k:
+            return T_CRIT_95[k]
+    return 1.96
+
+
+def sequential_stop(windows, seconds=None, tol=2.0, window_s=60.0, batches=6,
+                    confirm=2, horizon_s=600.0):
+    """A stopping rule a certification service could actually deploy.
+
+    The two t_converge estimators are oracles: they are the shortest test that would
+    have worked, computed with hindsight from the whole run. Nobody can run them live.
+    This rule looks only at the past. At each second it checks the last `window_s`
+    seconds and stops when both conditions hold for `confirm` consecutive checks:
+
+      precision  the 95% confidence interval on the mean of that window is narrower
+                 than tol% of it. The interval is built from batch means, not from raw
+                 per-second samples, because consecutive seconds on a heating GPU are
+                 correlated and a naive standard error would claim confidence the data
+                 does not support.
+      durability the least-squares trend across that window, projected forward over
+                 `horizon_s`, moves the answer by less than tol%. Local flatness alone is
+                 not enough: a card drifting slowly looks flat across any 60 s you choose
+                 while still sitting far from where it ends up, and a card drifting
+                 linearly never settles at all. Projecting the trend is what separates
+                 "quiet right now" from "still true in ten minutes", and it is the only
+                 criterion here that refuses to rate a card that is still moving.
+
+    Returns the stop time, the estimate at that moment, and the realized error against
+    the full-run reference, which is how you find out whether the rule stops too early.
+    """
+    n = len(windows or [])
+    if n < 20:
+        return None
+    if not seconds or len(seconds) != n:
+        seconds = [1.0] * n
+    end, acc = [], 0.0
+    for s in seconds:
+        acc += s
+        end.append(acc)
+    tail = [w for w, e in zip(windows, end) if e >= 0.75 * acc]
+    ref = statistics.median(tail or windows)
+    if not ref:
+        return None
+    base = {"reference_tflops": ref, "window_s": window_s, "batches": batches,
+            "horizon_s": horizon_s}
+    tc, streak = t_crit(batches - 1), 0
+
+    for i in range(n):
+        if end[i] < window_s:
+            continue
+        lo = end[i] - window_s
+        idx = [j for j in range(i + 1) if end[j] > lo]
+        if len(idx) < batches * 3:
+            continue
+        vals = [windows[j] for j in idx]
+        ts = [end[j] for j in idx]
+        m = statistics.mean(vals)
+        if not m:
+            continue
+        b = len(vals) // batches
+        bm = [statistics.mean(vals[k * b:(k + 1) * b]) for k in range(batches)]
+        bt = [statistics.mean(ts[k * b:(k + 1) * b]) for k in range(batches)]
+        hw_pct = tc * statistics.stdev(bm) / (batches ** 0.5) / m * 100
+
+        # Trend on the batch means, carried out to the horizon as an upper confidence
+        # bound rather than a point estimate. A slope read off one short window is itself
+        # noisy, and projecting a noisy slope forward multiplies that noise by the
+        # horizon, so a point estimate would pass by luck on a card that is still moving.
+        mb, mt = statistics.mean(bm), statistics.mean(bt)
+        den = sum((t - mt) ** 2 for t in bt)
+        slope = (sum((t - mt) * (v - mb) for t, v in zip(bt, bm)) / den) if den else 0.0
+        resid = [v - (mb + slope * (t - mt)) for t, v in zip(bt, bm)]
+        se = ((sum(r * r for r in resid) / (batches - 2) / den) ** 0.5
+              if batches > 2 and den else 0.0)
+        drift_pct = (abs(slope) + t_crit(batches - 2) * se) * horizon_s / m * 100
+
+        streak = streak + 1 if (hw_pct <= tol and drift_pct <= tol) else 0
+        if streak >= confirm:
+            err = abs(m - ref) / ref * 100
+            return dict(base, stopped=True, t_stop_s=end[i], estimate_tflops=m,
+                        ci_halfwidth_pct=hw_pct, projected_drift_pct=drift_pct,
+                        realized_error_pct=err, within_tol=err <= tol)
+    return dict(base, stopped=False, t_stop_s=None, estimate_tflops=None,
+                ci_halfwidth_pct=None, projected_drift_pct=None, realized_error_pct=None,
+                within_tol=False)
+
+
+STATES = ("cold", "warm", "recooled")
+
+
+def rep_state(rep):
+    if rep.get("state"):
+        return rep["state"]
+    if rep.get("cooled"):
+        return "recooled"
+    return "cold" if rep.get("cold") else "warm"
+
+
 def worst(xs):
     if not xs:
         return "n/a"
@@ -535,48 +717,127 @@ def worst(xs):
     return fmt(max(xs))
 
 
+def present_states(rows):
+    return [s for s in STATES if any(r["state"] == s for r in rows)]
+
+
 def length_table(rows, lines):
-    lines += ["| SKU | repeats | sustained TFLOPS | cold: median s | cold: worst s | "
-              "warm: median s | warm: worst s | never converged | 60s bias % | median $/hr | "
-              "cold converged test $ |", "|" + "---|" * 11]
+    st = present_states(rows)
+    head = "| SKU | repeats | sustained TFLOPS |"
+    for s in st:
+        head += f" {s}: median s | {s}: worst s |"
+    head += " never converged | 60s bias % | median $/hr |"
+    lines += [head, "|" + "---|" * (6 + 2 * len(st))]
     for sku in sorted({r["sku"] for r in rows}):
         rs = [r for r in rows if r["sku"] == sku]
-        cold = [r["t_tol"] for r in rs if r["cold"]]
-        warm = [r["t_tol"] for r in rs if not r["cold"]]
-        costs = [r["price"] * r["t_tol"] / 3600 for r in rs
-                 if r["cold"] and r["price"] and r["t_tol"]]
-        lines.append(
-            f"| {sku} | {len(rs)} | {fmt(med([r['sustained'] for r in rs]))} | "
-            f"{fmt(med(cold))} | {worst(cold)} | {fmt(med(warm))} | {worst(warm)} | "
-            f"{sum(1 for r in rs if r['t_tol'] is None)} of {len(rs)} | "
-            f"{fmt(med([r['bias60'] for r in rs]))} | {fmt(med([r['price'] for r in rs]), 2)} | "
-            f"{fmt(med(costs), 3) if costs else 'n/a'} |")
+        cells = ""
+        for s in st:
+            xs = [r["t_tol"] for r in rs if r["state"] == s]
+            cells += f" {fmt(med(xs))} | {worst(xs)} |"
+        lines.append(f"| {sku} | {len(rs)} | {fmt(med([r['sustained'] for r in rs]))} |"
+                     f"{cells} {sum(1 for r in rs if r['t_tol'] is None)} of {len(rs)} | "
+                     f"{fmt(med([r['bias60'] for r in rs]))} | "
+                     f"{fmt(med([r['price'] for r in rs]), 2)} |")
 
 
-def fleet_table(rows, fleet, lines):
-    lines += [f"| SKU | cold s to tol | GPU-hours for {fleet:,} | $ for {fleet:,} | "
-              "fixed 60 s GPU-hours | fixed 60 s $ | what a fixed 60 s test does |",
-              "|" + "---|" * 7]
+def fleet_table(rows, fleet, ovh, lines):
+    lines += [f"| SKU | cold s to tol | overhead s | GPU-hours, test only | $ test only | "
+              f"GPU-hours, all in | $ all in | share of the bill that is test time |",
+              "|" + "---|" * 8]
     for sku in sorted({r["sku"] for r in rows}):
         rs = [r for r in rows if r["sku"] == sku]
-        cold = [r["t_tol"] for r in rs if r["cold"]]
-        t = med(cold)
-        price = med([r["price"] for r in rs])
+        cold = [r["t_tol"] for r in rs if r["state"] == "cold"]
+        t, price, o = med(cold), med([r["price"] for r in rs]), ovh.get(sku)
         gh = fleet * t / 3600 if t else None
-        gh60 = fleet * 60 / 3600
-        n_never = sum(1 for x in cold if x is None)
-        if t is None:
-            verdict = "no cold run converged: no defensible length exists in this data"
-        elif n_never:
-            verdict = (f"{n_never} of {len(cold)} cold runs never converged, "
-                       f"so {t:.0f} s is a lower bound")
-        elif t <= 60:
-            verdict = f"converges, pays {60 - t:.0f} s/GPU it does not need"
-        else:
-            verdict = f"misrates: {t - 60:.0f} s/GPU short of converged"
-        lines.append(f"| {sku} | {fmt(t)} | {fmt(gh)} | "
-                     f"{fmt(gh * price if gh and price else None, 0)} | {fmt(gh60)} | "
-                     f"{fmt(gh60 * price if price else None, 0)} | {verdict} |")
+        gha = fleet * (t + o) / 3600 if t and o is not None else None
+        share = f"{t / (t + o) * 100:.0f}%" if t and o else "unknown"
+        lines.append(f"| {sku} | {fmt(t)} | {fmt(o, 0) if o is not None else 'unknown'} | "
+                     f"{fmt(gh)} | {fmt(gh * price if gh and price else None, 0)} | "
+                     f"{fmt(gha)} | {fmt(gha * price if gha and price else None, 0)} | "
+                     f"{share} |")
+
+
+def overhead_section(runs, lines):
+    """Everything billed before the first measured second, which usually dominates."""
+    rows = []
+    for run in runs:
+        t = run["res"].get("timings") or {}
+        inf = run["res"].get("inference")
+        ml = inf[0].get("model_load_s") if isinstance(inf, list) and inf else None
+        a, pstart, fw = t.get("instance_start"), t.get("process_start"), t.get("first_window")
+        rows.append({"sku": run["fp"]["gpu"]["name"], "provider": run["fp"]["provider"],
+                     "run": run["dir"].name, "price": run["fp"].get("price_per_hr"),
+                     "provision": pstart - a if a and pstart else None,
+                     "to_first": fw - pstart if fw and pstart else None,
+                     "model_load": ml, "total": overhead(t)})
+    known = [r for r in rows if r["total"] is not None]
+    if not known:
+        lines += ["No run recorded an instance start, so overhead is unmeasured and every",
+                  "cost figure below counts test time only. Run `setup.sh` first, or pass",
+                  "`--instance-start`, or these numbers understate the real bill.", ""]
+        return {}
+    lines += ["| SKU | provider | run | provision to process s | process to first window s | "
+              "model load s | total overhead s |", "|" + "---|" * 7]
+    for r in rows:
+        lines.append(f"| {r['sku']} | {r['provider']} | {r['run']} | {fmt(r['provision'], 0)} | "
+                     f"{fmt(r['to_first'], 0)} | {fmt(r['model_load'], 0)} | "
+                     f"{fmt(r['total'], 0)} |")
+    by_sku = {}
+    for sku in sorted({r["sku"] for r in known}):
+        by_sku[sku] = med([r["total"] for r in known if r["sku"] == sku])
+    lines += ["", f"- {len(known)} of {len(rows)} runs recorded an instance start.",
+              "- Overhead is billed GPU time you cannot benchmark your way out of. Compare it "
+              "to the test lengths above before concluding that test length is the cost driver.",
+              ""]
+    return by_sku
+
+
+def predictive_power(inst, lines):
+    rows = [i for i in inst if i.get("sus") and i.get("tok")]
+    if not rows:
+        lines.append("No instance has both a compute score and an inference result yet.")
+        return
+    for i in rows:
+        i["ratio"] = i["tok"] / i["sus"]
+    lines += ["Delivered output tokens per sustained TFLOPS. If that ratio holds across "
+              "instances of a SKU, the compute score can stand in for the workload. If it "
+              "moves, the score cannot carry a price.", "",
+              "| SKU | instances | median tok/s per TFLOPS | spread across instances | "
+              "ranking pairs that agreed |", "|" + "---|" * 5]
+    cc = nn = 0
+    for sku in sorted({i["sku"] for i in rows}):
+        xs = [i for i in rows if i["sku"] == sku]
+        rs = [i["ratio"] for i in xs]
+        spread = (max(rs) / min(rs) - 1) * 100 if len(rs) > 1 and min(rs) else None
+        c = n = 0
+        for a in range(len(xs)):
+            for b in range(a + 1, len(xs)):
+                n += 1
+                c += (xs[a]["sus"] - xs[b]["sus"]) * (xs[a]["tok"] - xs[b]["tok"]) > 0
+        cc, nn = cc + c, nn + n
+        lines.append(f"| {sku} | {len(xs)} | {fmt(med(rs), 2)} | "
+                     f"{fmt(spread) + '%' if spread is not None else 'n/a'} | {c} of {n} |")
+    errs = []
+    for sku in sorted({i["sku"] for i in rows}):
+        xs = [i for i in rows if i["sku"] == sku]
+        r0 = med([i["ratio"] for i in xs])
+        errs += [abs(r0 * i["sus"] - i["tok"]) / i["tok"] * 100 for i in xs]
+    lines += ["", f"- Pricing off the compute score: predicting delivered tokens from the SKU "
+              f"median ratio is off by {fmt(med(errs))}% at the median, {fmt(max(errs))}% at "
+              "the worst. That error is the floor on how precisely a compute certificate can "
+              "price inference.",
+              f"- Ranking agreement across all within-SKU pairs: {cc} of {nn}."]
+    if nn < 6:
+        lines.append(f"- {nn} pairs cannot support a correlation coefficient. Two instances per "
+                     "SKU gives one pair each. Spearman returns nothing below 3 instances and "
+                     "nothing distinguishable from chance below about 5, so none is reported. "
+                     "The spread and the pricing error above are what this sample can carry.")
+    for sku in sorted({i["sku"] for i in rows}):
+        xs = [i for i in rows if i["sku"] == sku]
+        if len(xs) >= 5:
+            lines.append(f"- {sku}: Spearman rho "
+                         f"{fmt(spearman([i['sus'] for i in xs], [i['tok'] for i in xs]), 2)} "
+                         f"over {len(xs)} instances.")
 
 
 def cmd_analyze(args):
@@ -589,7 +850,7 @@ def cmd_analyze(args):
     estimators = [("from_start", 0.0), (f"warmup{args.warmup:g}s", float(args.warmup))]
     names = [n for n, _ in estimators]
     per_run = {n: [] for n in names}
-    curve_rows = []
+    stops, curve_rows = [], []
 
     for run in runs:
         fp, res = run["fp"], run["res"]
@@ -599,99 +860,168 @@ def cmd_analyze(args):
             w, s = g.get("window_tflops"), g.get("window_seconds")
             if not w:
                 continue
-            tel = g.get("telemetry", {})
+            state, tel = rep_state(rep), g.get("telemetry", {})
+            common = {"sku": sku, "provider": fp["provider"], "run": run["dir"].name,
+                      "repeat": rep["repeat"], "state": state, "price": fp.get("price_per_hr")}
             for name, warm in estimators:
                 c = convergence(w, s, tols=tols, warmup=warm)
                 if not c:
                     continue
                 for t, e in zip(c["t_s"], c["errors_pct"]):
-                    curve_rows.append([name, sku, fp["provider"], run["dir"].name, rep["repeat"],
-                                       "cold" if rep.get("cold") else "warm",
-                                       round(t, 3), round(e, 4)])
-                per_run[name].append({
-                    "estimator": name, "sku": sku, "provider": fp["provider"],
-                    "run": run["dir"].name, "uuid": fp["gpu"].get("uuid"),
-                    "repeat": rep["repeat"], "cold": rep.get("cold", False),
-                    "price": fp.get("price_per_hr"),
-                    "power_limit": fp["gpu"].get("power.limit"),
-                    "driver": fp["gpu"].get("driver_version"),
-                    "sustained": c["reference_tflops"], "run_length_s": c["total_s"],
-                    "t1": c["t_converge_1pct_s"], "t2": c["t_converge_2pct_s"],
-                    "t5": c["t_converge_5pct_s"], "t_tol": c[key],
-                    "bias60": c["short_test_bias_pct_at_60s"],
-                    "power_cap_frac": tel.get("throttle_fraction", {}).get("power_cap"),
-                    "thermal_frac": tel.get("throttle_fraction", {}).get("thermal"),
-                    "membw": (rep.get("membw") or {}).get("median_gbps"),
-                })
+                    curve_rows.append([name, sku, fp["provider"], run["dir"].name,
+                                       rep["repeat"], state, round(t, 3), round(e, 4)])
+                per_run[name].append(dict(
+                    common, estimator=name, uuid=fp["gpu"].get("uuid"),
+                    cold=state == "cold", power_limit=fp["gpu"].get("power.limit"),
+                    driver=fp["gpu"].get("driver_version"),
+                    sustained=c["reference_tflops"], run_length_s=c["total_s"],
+                    t1=c["t_converge_1pct_s"], t2=c["t_converge_2pct_s"],
+                    t5=c["t_converge_5pct_s"], t_tol=c[key],
+                    bias60=c["short_test_bias_pct_at_60s"],
+                    power_cap_frac=tel.get("throttle_fraction", {}).get("power_cap"),
+                    thermal_frac=tel.get("throttle_fraction", {}).get("thermal"),
+                    membw=(rep.get("membw") or {}).get("median_gbps")))
+            sr = sequential_stop(w, s, tol=args.tol, window_s=args.stop_window,
+                                 batches=args.stop_batches, confirm=args.stop_confirm,
+                                 horizon_s=args.stop_horizon)
+            if sr:
+                stops.append(dict(common, **sr))
 
     lines = ["# gpubench summary", "",
              f"Tolerance {args.tol:g}%. Benchmark length is total wall time on the GPU, "
-             f"warm-up included. Fleet figures assume {args.fleet:,} GPUs.", ""]
+             f"warm-up included. Fleet figures assume {args.fleet:,} GPUs.", "",
+             "Three ways of turning a run into one number are compared. The first two are "
+             "**oracles**: they use the full run to say what the shortest sufficient test "
+             "would have been, which nobody can know while the test is running. The third is "
+             "**causal** and is the only one that could be deployed.", ""]
 
-    # Headline: required test length by SKU, cold vs warm, under both estimators
-    lines += [f"## Benchmark length needed to land within {args.tol:g}% of steady state", ""]
+    lines += [f"## 1. Oracle: length needed to land within {args.tol:g}% of steady state", ""]
     for name, warm in estimators:
-        lines += [f"### Estimator `{name}`: " + ("average from second one"
-                  if not warm else f"discard the first {warm:g} s"), ""]
+        lines += [f"### `{name}`: " + ("average from second one" if not warm
+                                       else f"discard the first {warm:g} s"), ""]
         length_table(per_run[name], lines)
         lines.append("")
     lines += [f"A warm-up estimator cannot report a test shorter than its own warm-up, so "
-              f"`{names[1]}` floors at about {args.warmup:g} s. Where a SKU shows that floor, the "
-              f"estimator is setting the test length, not the card.", "",
-              "Positive 60s bias means a one-minute test overstates steady-state performance.",
-              "60s bias is the from_start estimator by definition: it is what a naive "
-              "one-minute test reports. It is blank for runs shorter than 60 s.", ""]
+              f"`{names[1]}` floors at about {args.warmup:g} s. Where a SKU shows that floor, "
+              "the estimator is setting the length, not the card.", "",
+              "Positive 60s bias means a one-minute test overstates steady-state throughput. "
+              "It is blank for runs shorter than 60 s.", ""]
 
-    # The estimator decision, side by side
-    lines += ["## Which estimator", "",
-              "| SKU | state | " + " | ".join(f"{n} median s" for n in names) + " | "
-              + " | ".join(f"{n} never" for n in names) + " |",
-              "|" + "---|" * (2 + 2 * len(names))]
+    lines += ["## 2. Causal: a sequential stopping rule you could ship", "",
+              f"Stops when the 95% confidence interval on the last {args.stop_window:g} s "
+              f"(batch means, {args.stop_batches} batches) is under {args.tol:g}% and the "
+              f"trend across that window projected {args.stop_horizon:g} s forward moves the "
+              f"answer by less than {args.tol:g}%, for {args.stop_confirm} consecutive checks. "
+              "The projection is what refuses to rate a card that is still drifting, which "
+              "local flatness cannot detect.", ""]
+    if stops:
+        lines += ["| SKU | state | runs | stopped | median stop s | worst stop s | "
+                  "median realized error % | worst realized error % | stopped early (over tol) |",
+                  "|" + "---|" * 9]
+        for sku in sorted({r["sku"] for r in stops}):
+            for st in present_states(stops):
+                xs = [r for r in stops if r["sku"] == sku and r["state"] == st]
+                if not xs:
+                    continue
+                done = [r for r in xs if r["stopped"]]
+                es = [r["realized_error_pct"] for r in done]
+                lines.append(
+                    f"| {sku} | {st} | {len(xs)} | {len(done)} | "
+                    f"{fmt(med([r['t_stop_s'] for r in done]))} | "
+                    f"{fmt(max([r['t_stop_s'] for r in done]) if done else None)} | "
+                    f"{fmt(med(es), 2)} | {fmt(max(es) if es else None, 2)} | "
+                    f"{sum(1 for r in done if not r['within_tol'])} |")
+        lines += ["", f"The rule cannot return an answer before {args.stop_window:g} s, because "
+                  "that is how long it takes to demonstrate precision. On a fast-settling SKU "
+                  "the oracle length is therefore unattainable: the shortest defensible test is "
+                  "set by how long it takes to prove convergence, not by how long the card takes "
+                  "to converge. 'Stopped early' counts runs where the rule fired but the answer "
+                  "was outside tolerance; those are false confidence and matter more than "
+                  "a slow stop.", ""]
+    else:
+        lines += ["No run was long enough to evaluate the stopping rule.", ""]
+
+    lines += ["## 3. Which rule to use", "",
+              "| SKU | state | " + " | ".join(f"{n} (oracle)" for n in names)
+              + " | sequential stop (causal) | realized error at stop % |",
+              "|" + "---|" * (4 + len(names))]
     for sku in sorted({r["sku"] for r in per_run[names[0]]}):
-        for state in ("cold", "warm"):
+        for st in present_states(per_run[names[0]]):
             sel = {n: [r["t_tol"] for r in per_run[n]
-                       if r["sku"] == sku and r["cold"] == (state == "cold")] for n in names}
+                       if r["sku"] == sku and r["state"] == st] for n in names}
             if not any(sel.values()):
                 continue
-            lines.append(f"| {sku} | {state} | "
-                         + " | ".join(fmt(med(sel[n])) for n in names) + " | "
-                         + " | ".join(str(sum(1 for x in sel[n] if x is None)) for n in names)
-                         + " |")
+            sx = [r for r in stops if r["sku"] == sku and r["state"] == st and r["stopped"]]
+            lines.append(f"| {sku} | {st} | " + " | ".join(fmt(med(sel[n])) for n in names)
+                         + f" | {fmt(med([r['t_stop_s'] for r in sx]))} | "
+                         f"{fmt(med([r['realized_error_pct'] for r in sx]), 2)} |")
     lines.append("")
 
-    # Fleet-scale cost
-    lines += [f"## Cost to certify {args.fleet:,} GPUs at {args.tol:g}%", ""]
-    for name, warm in estimators:
-        lines += [f"### Estimator `{name}`", ""]
-        fleet_table(per_run[name], args.fleet, lines)
+    # Thermal or software: only answerable when a cooldown repeat exists
+    recooled = [r for r in per_run[names[0]] if r["state"] == "recooled"]
+    lines += ["## 4. Is the cold penalty thermal or software?", ""]
+    if not recooled:
+        lines += ["No run used --cooldown, so repeat 0 confounds a cold card with a cold "
+                  "process (cuBLAS autotune, first-touch allocation). Until one does, a cold "
+                  "penalty cannot be attributed to temperature.", ""]
+    else:
+        lines += ["| SKU | cold s | warm s | cold-again s | reading |", "|" + "---|" * 5]
+        for sku in sorted({r["sku"] for r in recooled}):
+            g = {s: med([r["t_tol"] for r in per_run[names[0]]
+                         if r["sku"] == sku and r["state"] == s]) for s in STATES}
+            verdict = "inconclusive"
+            if all(g[s] is not None for s in STATES) and g["cold"] != g["warm"]:
+                frac = (g["recooled"] - g["warm"]) / (g["cold"] - g["warm"])
+                verdict = ("thermal: the penalty comes back when the card cools" if frac > 0.6
+                           else "software: a one-time per-process cost, not temperature"
+                           if frac < 0.3 else "mixed")
+            lines.append(f"| {sku} | {fmt(g['cold'])} | {fmt(g['warm'])} | "
+                         f"{fmt(g['recooled'])} | {verdict} |")
+        for run in runs:
+            cd = run["res"].get("cooldown")
+            if cd:
+                t = cd.get("telemetry", {})
+                lines.append(f"- {run['dir'].name}: idled {cd['minutes']:g} min, temperature "
+                             f"{fmt(t.get('temp_c_first'), 0)} C to {fmt(t.get('temp_c_last'), 0)} C")
         lines.append("")
-    lines += ["Cold time-to-converge is also the idle time each seller gives up per card.",
+
+    lines += ["## 5. Where the billed time actually goes", ""]
+    ovh = overhead_section(runs, lines)
+
+    lines += [f"## 6. Cost to certify {args.fleet:,} GPUs at {args.tol:g}%", ""]
+    if stops:
+        lines += ["### Causal: sequential stop. This is the one to quote.", ""]
+        fleet_table([dict(r, t_tol=r["t_stop_s"], sustained=r["reference_tflops"])
+                     for r in stops], args.fleet, ovh, lines)
+        lines.append("")
+    for name, warm in estimators:
+        lines += [f"### Oracle `{name}`: a lower bound, not a plan", ""]
+        fleet_table(per_run[name], args.fleet, ovh, lines)
+        lines.append("")
+    lines += ["Cold time-to-converge is also the idle time each seller gives up per card. "
               "The cold column is a median over the cold runs that converged; runs that never "
-              "converged are counted in the verdict, not averaged into the number.", ""]
+              "converged are counted in the length tables, not averaged into this number.", ""]
 
-    # Per-run detail
-    lines += ["## Per run", "",
+    lines += ["## 7. Per run", "",
               "| SKU | provider | run | rep | state | power W | driver | sustained | run len s | "
-              + " | ".join(f"t {n}" for n in names) + " | t1% | t5% | power-cap frac | "
-              "thermal frac | mem GB/s |",
-              "|" + "---|" * (14 + len(names))]
+              + " | ".join(f"t {n}" for n in names) + " | t stop | t1% | t5% | power-cap frac | "
+              "thermal frac | mem GB/s |", "|" + "---|" * (15 + len(names))]
     other = {(r["run"], r["repeat"]): r for r in per_run[names[1]]}
+    stopmap = {(r["run"], r["repeat"]): r for r in stops}
     for r in per_run[names[0]]:
-        o = other.get((r["run"], r["repeat"]), {})
+        k = (r["run"], r["repeat"])
         lines.append(f"| {r['sku']} | {r['provider']} | {r['run']} | {r['repeat']} | "
-                     f"{'cold' if r['cold'] else 'warm'} | {r['power_limit']} | {r['driver']} | "
-                     f"{fmt(r['sustained'])} | {fmt(r['run_length_s'], 0)} | "
-                     f"{fmt(r['t_tol'])} | {fmt(o.get('t_tol'))} | "
-                     f"{fmt(r['t1'])} | {fmt(r['t5'])} | "
-                     f"{fmt(r['power_cap_frac'], 2)} | {fmt(r['thermal_frac'], 2)} | "
-                     f"{fmt(r['membw'], 0)} |")
+                     f"{r['state']} | {r['power_limit']} | {r['driver']} | "
+                     f"{fmt(r['sustained'])} | {fmt(r['run_length_s'], 0)} | {fmt(r['t_tol'])} | "
+                     f"{fmt(other.get(k, {}).get('t_tol'))} | "
+                     f"{fmt(stopmap.get(k, {}).get('t_stop_s'))} | {fmt(r['t1'])} | "
+                     f"{fmt(r['t5'])} | {fmt(r['power_cap_frac'], 2)} | "
+                     f"{fmt(r['thermal_frac'], 2)} | {fmt(r['membw'], 0)} |")
 
-    # Does the synthetic score predict the workload? (within SKU, across instances)
-    lines += ["", "## Does the compute score predict inference throughput?", ""]
+    lines += ["", "## 8. Does the compute score predict inference throughput?", ""]
     inst = []
     for run in runs:
-        inf = run["res"].get("inference")
-        reps = run["res"].get("repeats", [])
+        inf, reps = run["res"].get("inference"), run["res"].get("repeats", [])
         if isinstance(inf, list) and inf and reps:
             sus = []
             for rep in reps:
@@ -704,11 +1034,7 @@ def cmd_analyze(args):
             inst.append({"sku": run["fp"]["gpu"]["name"], "provider": run["fp"]["provider"],
                          "run": run["dir"].name, "sus": med(sus), "tok": tok, "price": price,
                          "usd_m": price / (tok * 3600) * 1e6 if price and tok else None})
-    for sku in sorted({i["sku"] for i in inst}):
-        xs = [i for i in inst if i["sku"] == sku and i["sus"] and i["tok"]]
-        rho = spearman([i["sus"] for i in xs], [i["tok"] for i in xs])
-        lines.append(f"- {sku}: {len(xs)} instances, rank correlation {fmt(rho, 2)}"
-                     f"{' (needs 3+ instances; 2 per SKU cannot produce one)' if rho is None else ''}")
+    predictive_power(inst, lines)
     if inst:
         lines += ["", "| SKU | provider | run | sustained TFLOPS | out tok/s | $/hr | $/M out tok |",
                   "|---|---|---|---|---|---|---|"]
@@ -716,18 +1042,16 @@ def cmd_analyze(args):
             lines.append(f"| {i['sku']} | {i['provider']} | {i['run']} | {fmt(i['sus'])} | "
                          f"{fmt(i['tok'], 0)} | {fmt(i['price'], 2)} | {fmt(i['usd_m'], 3)} |")
 
-    # Software vs hardware: same physical GPU, different software labels
     by_uuid = {}
     for run in runs:
         inf = run["res"].get("inference")
         if isinstance(inf, list) and inf:
-            u = run["fp"]["gpu"].get("uuid")
-            by_uuid.setdefault(u, []).append((run["fp"].get("label", "default"),
-                                              run["fp"]["software"].get("vllm"),
-                                              run["fp"]["software"].get("torch"),
-                                              med([i["output_tokens_per_s"] for i in inf])))
+            by_uuid.setdefault(run["fp"]["gpu"].get("uuid"), []).append(
+                (run["fp"].get("label", "default"), run["fp"]["software"].get("vllm"),
+                 run["fp"]["software"].get("torch"),
+                 med([i["output_tokens_per_s"] for i in inf])))
     sw = {u: v for u, v in by_uuid.items() if len({x[0] for x in v}) > 1}
-    lines += ["", "## Same GPU, different software stack", ""]
+    lines += ["", "## 9. Same GPU, different software stack", ""]
     if not sw:
         lines.append("No GPU was run under more than one --label yet.")
     for u, v in sw.items():
@@ -737,35 +1061,44 @@ def cmd_analyze(args):
             lines.append(f"  - {label} (vllm {vv}, torch {tv}): {fmt(tok, 0)} tok/s, "
                          f"{fmt((tok - base) / base * 100 if base and tok else None)}% vs first")
 
-    # Anything that would make a number untrustworthy
-    lines += ["", "## Data quality flags", ""]
+    lines += ["", "## 10. Data quality flags", ""]
     flags = []
     for r in per_run[names[0]]:
         tag = f"{r['sku']} {r['run']} rep {r['repeat']}"
         if r["run_length_s"] and r["run_length_s"] < 300:
-            flags.append(f"- {tag}: run only {r['run_length_s']:.0f} s long, "
-                         "too short to establish steady state")
+            flags.append(f"- {tag}: run only {r['run_length_s']:.0f} s, too short to establish "
+                         "steady state")
         if r["t_tol"] is None:
-            flags.append(f"- {tag}: never converged within the run, so its steady state "
-                         "is an assumption, not a measurement")
+            flags.append(f"- {tag}: never converged, so its steady state is an assumption")
         if r["bias60"] is None:
             flags.append(f"- {tag}: shorter than 60 s, no 60s bias available")
+    for r in stops:
+        if r["stopped"] and not r["within_tol"]:
+            flags.append(f"- {r['sku']} {r['run']} rep {r['repeat']}: the stopping rule fired at "
+                         f"{r['t_stop_s']:.0f} s but was {r['realized_error_pct']:.1f}% off. "
+                         "False confidence: lengthen --stop-horizon or widen --stop-window.")
+        if not r["stopped"]:
+            flags.append(f"- {r['sku']} {r['run']} rep {r['repeat']}: the stopping rule never "
+                         "fired within the run")
     for run in runs:
+        if not (run["res"].get("timings") or {}).get("instance_start"):
+            flags.append(f"- {run['dir'].name}: no instance start recorded, overhead unknown")
         inf = run["res"].get("inference")
         if isinstance(inf, dict) and inf.get("skipped"):
             flags.append(f"- {run['dir'].name}: inference skipped ({inf['skipped']})")
         for rep in run["res"].get("repeats", []):
-            n = ((rep.get("gemm") or {}).get("telemetry") or {}).get("samples", 0)
-            if not n:
-                flags.append(f"- {run['dir'].name} rep {rep.get('repeat')}: GEMM telemetry empty, "
-                             "throttle attribution unavailable")
+            if not ((rep.get("gemm") or {}).get("telemetry") or {}).get("samples", 0):
+                flags.append(f"- {run['dir'].name} rep {rep.get('repeat')}: GEMM telemetry "
+                             "empty, throttle attribution unavailable")
     lines += sorted(set(flags)) or ["None."]
 
     text = "\n".join(lines)
     Path(args.dir, "summary.md").write_text(text)
     Path(args.dir, "summary.json").write_text(json.dumps(
-        {"tol": args.tol, "warmup": args.warmup, "fleet": args.fleet,
-         "estimators": names, "runs": per_run, "instances": inst}, indent=2))
+        {"tol": args.tol, "warmup": args.warmup, "fleet": args.fleet, "estimators": names,
+         "stop_rule": {"window_s": args.stop_window, "batches": args.stop_batches,
+                       "confirm": args.stop_confirm, "horizon_s": args.stop_horizon},
+         "runs": per_run, "stops": stops, "overhead_by_sku": ovh, "instances": inst}, indent=2))
     with open(Path(args.dir, "convergence.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["estimator", "sku", "provider", "run", "repeat", "state",
@@ -796,6 +1129,12 @@ def main():
                    help="skip GEMM and bandwidth; use with --label to compare software stacks on one box")
     r.add_argument("--label", default="default", help="software-stack label, e.g. vllm-0.8")
     r.add_argument("--out", default="results")
+    r.add_argument("--cooldown", type=float, default=0.0,
+                   help="idle this many minutes after the repeats, then run one more "
+                        "(cold-again): separates a thermal cold penalty from a software one")
+    r.add_argument("--instance-start", default=None,
+                   help="unix time or ISO timestamp at which you launched the instance, "
+                        "so the summary can price provisioning overhead, not just test time")
     r.set_defaults(func=cmd_run)
 
     i = sub.add_parser("inference", help="internal: the inference phase, spawned by run")
@@ -816,6 +1155,16 @@ def main():
                    help="seconds the second estimator discards as warm-up")
     a.add_argument("--fleet", type=int, default=10000,
                    help="fleet size for the cost-to-certify figures")
+    a.add_argument("--stop-window", type=float, default=180.0,
+                   help="seconds of recent data the sequential rule judges. Shorter windows "
+                        "cannot estimate the trend precisely enough to project it")
+    a.add_argument("--stop-batches", type=int, default=6,
+                   help="batches used for the confidence interval, to handle autocorrelation")
+    a.add_argument("--stop-confirm", type=int, default=2,
+                   help="consecutive passing checks before the rule stops")
+    a.add_argument("--stop-horizon", type=float, default=600.0,
+                   help="seconds ahead the window trend is projected; the rule will not rate "
+                        "a card whose answer is projected to move more than --tol over it")
     a.set_defaults(func=cmd_analyze)
 
     args = p.parse_args()

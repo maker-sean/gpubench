@@ -24,6 +24,10 @@ from matplotlib.lines import Line2D  # noqa: E402
 # Distinct in hue and in luminance, so the figure survives a grayscale print.
 PALETTE = ["#13375c", "#c0561b", "#2f7d53", "#6b4e9b", "#8a6d1f"]
 MARKERS = ["o", "s", "^", "D", "v"]
+# linestyle, linewidth, filled marker, legend label
+STYLES = {"cold": ("-", 1.9, True, "cold (first run)"),
+          "warm": ((0, (4, 2.5)), 1.3, False, "warm"),
+          "recooled": ((0, (1, 1.7)), 1.6, False, "cold again (after idle)")}
 
 
 def short(sku):
@@ -73,17 +77,17 @@ def panel(ax, data, tol, title):
     ceiling = tol * 2.5
     for i, sku in enumerate(skus):
         color = PALETTE[i % len(PALETTE)]
-        for state in ("cold", "warm"):
+        for state in STYLES:
             series = data.get((sku, state))
             if not series:
                 continue
             m, lo, hi = envelope(series, grid)
+            ls, lw, filled, _ = STYLES[state]
             cold = state == "cold"
             ax.fill_between(grid, lo, hi, color=color, alpha=0.12, lw=0, zorder=2)
-            ax.plot(grid, m, color=color, lw=1.9 if cold else 1.3,
-                    ls="-" if cold else (0, (4, 2.5)), zorder=4,
+            ax.plot(grid, m, color=color, lw=lw, ls=ls, zorder=4,
                     marker=MARKERS[i % len(MARKERS)], markevery=(14 * i + 20, 60), ms=4.2,
-                    mfc=color if cold else "white", mec=color, mew=1.1)
+                    mfc=color if filled else "white", mec=color, mew=1.1)
             ok = ~np.isnan(m) & (grid > 5)
             if ok.any():
                 ceiling = max(ceiling, float(np.nanmax(m[ok])))
@@ -108,8 +112,9 @@ def panel(ax, data, tol, title):
     handles = [Line2D([], [], color=PALETTE[i % len(PALETTE)], lw=1.9,
                       marker=MARKERS[i % len(MARKERS)], ms=4.2, label=short(sku))
                for i, sku in enumerate(skus)]
-    handles += [Line2D([], [], color="0.35", lw=1.9, ls="-", label="cold (first run)"),
-                Line2D([], [], color="0.35", lw=1.3, ls=(0, (4, 2.5)), label="warm")]
+    seen = {st for _, st in data}
+    handles += [Line2D([], [], color="0.35", lw=lw, ls=ls, label=lab)
+                for st, (ls, lw, _f, lab) in STYLES.items() if st in seen]
     ax.legend(handles=handles, fontsize=7.5, frameon=False, ncol=2,
               loc="upper right", handlelength=2.4, columnspacing=1.2)
     return skus

@@ -20,3 +20,7 @@ hf_token*
 # Working files, not part of the public artifact
 CLAUDE.md
 PROMPT.md
+
+# Per-instance billing stamp
+.gpubench_instance_start
+results-explore/

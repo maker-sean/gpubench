@@ -39,22 +39,43 @@ Telemetry every 500 ms: SM and memory clocks, power draw, temperature, throttle 
 Benchmark length `t` is always **total wall clock time on the GPU, warm-up included**. A test
 that discards its first 30 seconds still occupies the card for them, and still pays for them.
 
-### Two estimators, reported side by side
+### Three scoring rules, reported side by side
 
-Averaging from second one bakes the warm-up into the number, so a slow settling card can take
-a long time to converge for reasons that are arithmetic rather than physical. For a card
-decaying with drop `d` and time constant `tau`, that estimator converges at roughly
-`t = 100 * d * tau / tol`, which scales with the tolerance you picked and the shape of the
-ramp, not with anything a buyer experiences.
+Averaging from second one bakes the warm-up into the number, so a slow settling card takes a
+long time to converge for reasons that are arithmetic rather than physical. For a card
+decaying with drop `d` and time constant `tau`, that rule converges at roughly
+`t = 100 * d * tau / tol`: a figure you can derive from your own assumptions without renting
+anything, and one that moves by a third if you change the tolerance in a spreadsheet.
 
-`analyze` therefore reports both estimators:
+`analyze` therefore reports three rules, and the distinction between them matters more than
+any of their numbers:
 
-- `from_start`: average from second one. What a naive test reports.
-- `warmup<K>s`: discard the first K seconds (`--warmup`, default 30), then average.
+| Rule | What it is | Deployable? |
+|---|---|---|
+| `from_start` | average from second one | oracle |
+| `warmup<K>s` | discard the first K seconds (`--warmup`, default 30), then average | oracle |
+| sequential stop | stop when the interval is tight and the trend is flat | **causal** |
 
-Neither is obviously right. The warm-up estimator cannot report a test shorter than its own
-warm-up, so it floors at K seconds and is *worse* than `from_start` on fast settling SKUs.
-Reporting both is how you tell a property of the card from a property of the arithmetic.
+The first two are **oracles**. They use the complete run to say what the shortest sufficient
+test *would have been*, which nobody can know while a test is running. They are lower bounds,
+useful for showing how much room exists, not candidate rules.
+
+The sequential rule is **causal**: at each second it looks only at the past. It stops when the
+95% confidence interval on the last `--stop-window` seconds is narrower than the tolerance and
+the least-squares trend across that window is under `--stop-drift`, for `--stop-confirm`
+consecutive checks. The interval is built from batch means rather than raw per-second samples,
+because consecutive seconds on a heating GPU are correlated and a naive standard error would
+claim confidence the data does not support.
+
+Two consequences worth knowing before reading any result:
+
+- A rule that needs `--stop-window` seconds of data cannot return an answer sooner than that.
+  On a fast settling SKU the oracle length is therefore unattainable, and the shortest
+  defensible test is set by how long it takes to *prove* convergence, not by how long the card
+  takes to converge.
+- `analyze` reports the **realized error** at the stop, measured against the full-run
+  reference. A rule that stops quickly but lands outside tolerance is worse than a slow one.
+  That count is reported as "stopped early" and in the data quality flags.
 
 ## Setup (on each instance)
 
@@ -68,10 +89,25 @@ limit against its default limit, PCIe link and `CUDA_VISIBLE_DEVICES`, optionall
 pre-downloads the model so the download is not billed inside the timed run, then runs a short
 smoke test into a separate `results-smoke/` directory.
 
+It also writes `.gpubench_instance_start`, a timestamp used to price everything billed before
+the first measured second. That stamp is a lower bound, because it starts when you got a
+shell, not when the instance started charging. Pass the real value if you have it:
+
+```bash
+python gpubench.py run --provider runpod --price-per-hr 2.69 --instance-start 1762070400
+```
+
 ## Run
 
 ```bash
 python gpubench.py run --provider runpod --price-per-hr 2.69
+```
+
+Separate a thermal cold penalty from a one-time software one, by idling the card and running
+once more (adds the idle time to the bill, so use it on one instance per SKU, not all six):
+
+```bash
+python gpubench.py run --provider runpod --price-per-hr 2.69 --cooldown 15
 ```
 
 Software stack comparison on a box that has already been benchmarked:
@@ -92,10 +128,33 @@ python plot_convergence.py --estimator both
 marker per SKU, cold solid and warm dashed, a light band for the range across instances, and a
 shaded band at the tolerance.
 
+## Before committing to a 20 minute default
+
+The 20 minute GEMM is a guess. If a card has not settled within it there is no steady state to
+compare against and every number for that run reads "never". Spend one hour on the first and
+slowest SKU before standardising:
+
+```bash
+python gpubench.py run --provider runpod --price-per-hr 2.69 \
+  --repeats 1 --gemm-seconds 2700 --skip-inference --out results-explore
+python gpubench.py analyze --dir results-explore
+```
+
+If the cold run converges well inside 2700 s, 1200 s is safe. If it does not, raise
+`--gemm-seconds` for every instance before spending the budget, because a run that never
+settles cannot be rescued in analysis.
+
 ## Reading the results
 
-- **Time to converge**: the headline. Compared by SKU, cold against warm, and under both
-  estimators. Quote it with the estimator named; the number is meaningless without it.
+- **Stop time and realized error**: the headline pair. A stop time without its realized error
+  says nothing about whether the rule works. Quote both, and name the rule.
+- **Time to converge**: the oracle lower bound, by SKU and by state. Useful for showing the gap
+  between what was sufficient and what is provable. Never quote it as a recommendation.
+- **Overhead**: provisioning to first measured second. Compare it to the test lengths before
+  concluding that test length drives cost; usually it does not.
+- **Cold against cold-again**: with `--cooldown`, whether the cold penalty returns after the
+  card is idled. If it does, it is thermal. If it does not, repeat 0 was paying a one-time
+  software cost and the "cold" framing is wrong.
 - **60 s bias**: how far a one minute test lands from steady state. Positive means it
   overstates sustained throughput.
 - **Cost to certify**: GPU-hours and dollars to take a fleet to the tolerance, against what a
@@ -111,8 +170,10 @@ shaded band at the tolerance.
 ## Limitations
 
 - Single GPU only. No NVLink or InfiniBand, no multi-node collectives.
-- Small sample: a handful of devices per provider. Rank correlation between the synthetic
-  score and inference throughput needs at least 3 instances of a SKU to produce a number.
+- Small sample: a handful of devices per provider. Two instances per SKU gives one ranking
+  pair per SKU, which cannot support a correlation coefficient, so none is reported. What the
+  sample can carry is the spread in delivered tokens per TFLOPS and the error from pricing off
+  the compute score, and those are what `analyze` prints.
 - One model and one prompt shape for inference.
 - Hours, not months. This measures what changes a measurement, not how a rating drifts over
   time. Long term drift is a separate experiment.
