@@ -24,14 +24,6 @@ PY="$(command -v python3 || command -v python)"
 [ -n "$PY" ] || { echo "FAIL: no python on PATH"; exit 1; }
 cd "$(dirname "$0")"
 
-STAMP=".gpubench_instance_start"
-if [ ! -f "$STAMP" ]; then
-  date -u +%s > "$STAMP"
-  echo "Recorded instance start in $STAMP. This is a LOWER BOUND on overhead: it starts when"
-  echo "you got a shell, not when the instance started billing. Pass --instance-start to run"
-  echo "if you know when you clicked deploy."
-fi
-
 echo "=== 1. GPU ==="
 command -v nvidia-smi >/dev/null || { echo "FAIL: nvidia-smi not found"; exit 1; }
 nvidia-smi --query-gpu=index,name,driver_version,power.limit,power.default_limit,power.max_limit,clocks.max.sm,ecc.mode.current,persistence_mode,memory.total \
@@ -41,6 +33,17 @@ nvidia-smi --query-gpu=index,name,driver_version,power.limit,power.default_limit
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max \
   --format=csv
+
+# Only now, once a GPU is confirmed, record when this box started costing money.
+# Writing it before the check would leave a stale stamp on a machine that never ran
+# a benchmark, and a later run in this directory would quietly price against it.
+STAMP=".gpubench_instance_start"
+if [ ! -f "$STAMP" ]; then
+  date -u +%s > "$STAMP"
+  echo "Recorded instance start in $STAMP. This is a LOWER BOUND on overhead: it starts when"
+  echo "you got a shell, not when the instance started billing. Pass --instance-start to run"
+  echo "if you know when you clicked deploy."
+fi
 
 echo
 echo "=== 2. Software ==="
