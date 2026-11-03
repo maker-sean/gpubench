@@ -1,0 +1,22 @@
+# Benchmark scratch
+results-smoke/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+*.pem
+*.key
+hf_token*
+.huggingface/
+
+# macOS
+.DS_Store
+
+# Working files, not part of the public artifact
+CLAUDE.md
+PROMPT.md
