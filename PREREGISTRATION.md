@@ -9,6 +9,7 @@ the fact.
 | quantity | value |
 |---|---|
 | coolest loaded bin | 1350 MHz = **53.6% of boost** |
+| coolest loaded bin, first 5 s of load excluded | 1300 MHz = **51.6% of boost** |
 | steady clock | 1163 MHz = 46.2% of boost |
 | clock-temperature slope | **-0.171 % of boost per degC**, 95% CI **[-0.181, -0.161]** |
 | clock loss after first loaded sample | 7.40 points of boost |
@@ -28,6 +29,15 @@ combines cap and heat and cannot isolate either.
 
 - **The power-cap portion is a property of the SKU** if the second card's coolest loaded bin
   falls within **53.6 +/- 2.0 percentage points of boost**, i.e. **51.6% to 55.6%**.
+- **Same test, transient excluded (added before the second L40S existed).** The coolest
+  loaded bin can catch the first instant of load, before the power controller clamps the
+  clock: that is exactly what inflated the H100 figure, where skipping the first 5 s moves
+  it from 72.7% to 68.2% of boost. On the first L40S the same exclusion moves it from 53.6%
+  to **51.6%**, and is stable at 51.2% when 10 s are excluded. So the cap portion is a
+  property of the SKU if the second card's coolest loaded bin **with the first 5 s of load
+  excluded** falls within **51.6 +/- 2.0 percentage points**, i.e. **49.6% to 53.6%**.
+  Both versions are reported. The original band above is unchanged; this one sits beside it,
+  and where they disagree the transient-excluded version is the one to believe.
 - **The heat portion is a property of the host** if its slope falls **outside**
   [-0.181, -0.161] % of boost per degC.
 - **The heat portion is a property of the SKU** if its slope CI **overlaps**

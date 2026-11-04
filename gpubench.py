@@ -222,8 +222,20 @@ class Telemetry:
         return False
 
 
+def _elapsed(stamps):
+    """Seconds since the first sample, from nvidia-smi's own timestamps."""
+    for fmt in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S"):
+        try:
+            t0 = datetime.strptime(stamps[0], fmt)
+            return [(datetime.strptime(t, fmt) - t0).total_seconds() for t in stamps]
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
 def summarize_telemetry(path):
     sm, power, temp, flags = [], [], [], {k: 0 for k in THROTTLE_BITS}
+    stamps = []
     n = 0
     with open(path) as f:
         reader = csv.reader(f)
@@ -233,6 +245,7 @@ def summarize_telemetry(path):
                 continue
             row = [c.strip() for c in row]
             n += 1
+            stamps.append(row[0])
             for lst, val in ((sm, row[2]), (power, row[4]), (temp, row[5])):
                 v = to_float(val)
                 if v is not None:
@@ -257,14 +270,21 @@ def summarize_telemetry(path):
     # consecutive samples are nearly identical: on one card that produced a slope of the
     # wrong sign with a standard error small enough to look significant. Bin the loaded
     # samples by whole degrees first, so the regression sees one point per temperature.
-    mhz_per_c = mhz_per_c_lo = mhz_per_c_hi = at_idle = coolest_loaded = None
+    mhz_per_c = mhz_per_c_lo = mhz_per_c_hi = at_idle = coolest_loaded = coolest_ex5 = None
     t_lo = t_hi = n_bins = None
     if len(power) == len(sm) == len(temp) and len(sm) > 20 and max(power) > 0:
         thresh = 0.9 * max(power)
-        bins = {}
-        for a, b, c in zip(sm, temp, power):
+        el = _elapsed(stamps) or [i * 0.5 for i in range(len(sm))]
+        bins, bins_ex5 = {}, {}
+        for a, b, c, e in zip(sm, temp, power, el):
             if c > thresh:
                 bins.setdefault(round(b), []).append(a)
+                if e >= 5.0:
+                    bins_ex5.setdefault(round(b), []).append(a)
+        # The coolest loaded bin can catch the first instant of load, before the power
+        # controller clamps the clock. That transient is what inflated the H100 figure, so
+        # report a second version with the first 5 s of load excluded.
+        coolest_ex5 = (statistics.mean(bins_ex5[min(bins_ex5)]) if bins_ex5 else None)
         bt = sorted(bins)
         if len(bt) >= 5:
             bs = [statistics.mean(bins[b]) for b in bt]
@@ -297,6 +317,7 @@ def summarize_telemetry(path):
         "sm_mhz_per_degc_ci": [mhz_per_c_lo, mhz_per_c_hi],
         "sm_mhz_at_idle_temp": at_idle,
         "sm_mhz_coolest_loaded": coolest_loaded,
+        "sm_mhz_coolest_loaded_ex5s": coolest_ex5,
         "temp_c_idle": min(temp) if temp else None,
         "temp_loaded_range": [t_lo, t_hi],
         "temp_bins": n_bins,
@@ -839,6 +860,9 @@ def clock_budget(tel, boost_mhz):
         "boost_mhz": boost, "steady_mhz": steady,
         "steady_pct_of_boost": steady / boost * 100,
         "lost_to_power_cap_pct": (boost - cool) / boost * 100 if (cool and measurable) else None,
+        "cap_test_coolest_bin_pct": (floor_src / boost * 100) if floor_src else None,
+        "cap_test_ex5s_pct": ((tel.get("sm_mhz_coolest_loaded_ex5s") or 0) / boost * 100
+                              if tel.get("sm_mhz_coolest_loaded_ex5s") else None),
         # Descriptive, no causal claim: the clock does fall after the first loaded sample,
         # but on a card with no measurable temperature sensitivity that is a power-management
         # transient, not heat. Only promote it to a heat figure when the slope excludes zero.
@@ -1131,10 +1155,11 @@ def cmd_analyze(args):
                   "bites the instant the kernel starts, and heat, which builds over minutes. "
                   "Only the second part is what a short test misses.", "",
                   "| SKU | run | rep | boost MHz | steady MHz | steady % of boost | "
+                  "cap test: coolest bin % | cap test: excl first 5 s % | "
                   "clock loss after first loaded % | heat floor % | heat model % | "
                   "% boost per degC | 95% CI | "
                   "loaded temp range C | sensitivity |",
-                  "|" + "---|" * 13]
+                  "|" + "---|" * 15]
         for r in stops:
             cb = r.get("clock_budget")
             if not cb:
@@ -1144,6 +1169,8 @@ def cmd_analyze(args):
             rng = cb.get("loaded_temp_range_c") or [None, None]
             lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | {fmt(cb['boost_mhz'],0)} | "
                          f"{fmt(cb['steady_mhz'],0)} | {fmt(cb['steady_pct_of_boost'],1)} | "
+                         f"{fmt(cb['cap_test_coolest_bin_pct'],1)} | "
+                         f"{fmt(cb['cap_test_ex5s_pct'],1)} | "
                          f"{fmt(cb['clock_loss_after_first_loaded_pct'],2)} | "
                          f"{fmt(cb['heat_floor_pct'],2)} | {fmt(cb['heat_model_pct'],2)} | "
                          f"{fmt(cb['pct_of_boost_per_degc'],3)} | {cis} | "
