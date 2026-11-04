@@ -245,8 +245,25 @@ def summarize_telemetry(path):
                     flags[k] += 1
     if n == 0:
         return {"samples": 0}
+    # Clock against temperature is the discriminator the throttle flags miss. A card held
+    # at its power limit sheds clock as it warms, because hotter silicon leaks more current
+    # and the same watts buy fewer MHz. Nothing sets a thermal flag while that happens: the
+    # reported reason stays SwPowerCap throughout. Branching on thermal_fraction alone would
+    # call such a card thermally unaffected.
+    q = max(len(sm) // 4, 1)
+    q1, q4 = (statistics.mean(sm[:q]), statistics.mean(sm[-q:])) if sm else (None, None)
+    corr = None
+    if len(sm) > 2 and len(temp) == len(sm):
+        ms, mt = statistics.mean(sm), statistics.mean(temp)
+        den = (sum((a - ms) ** 2 for a in sm) * sum((b - mt) ** 2 for b in temp)) ** 0.5
+        if den:
+            corr = sum((a - ms) * (b - mt) for a, b in zip(sm, temp)) / den
     return {
         "samples": n,
+        "sm_mhz_q1_mean": q1,
+        "sm_mhz_q4_mean": q4,
+        "sm_decline_pct": (q1 - q4) / q1 * 100 if q1 else None,
+        "clock_temp_corr": corr,
         "sm_mhz_mean": statistics.mean(sm) if sm else None,
         "sm_mhz_min": min(sm) if sm else None,
         "power_w_mean": statistics.mean(power) if power else None,
@@ -372,6 +389,17 @@ def cmd_run(args):
     print(f"[gpubench] {fp['gpu']['name']} | driver {fp['gpu']['driver_version']} | "
           f"power limit {fp['gpu']['power.limit']} of {fp['gpu']['power.default_limit']} W | "
           f"smi target {target} -> {out}")
+
+    if args.fingerprint_only:
+        # Census mode: record what this host actually gave us, then get off the clock.
+        # Power limit is not published by any provider before rental, so the only way to
+        # survey it is to rent briefly and read it.
+        (out / "results.json").write_text(json.dumps({"repeats": [], "timings": timings,
+                                                      "census": True}, indent=2))
+        print(f"[gpubench] census: {fp['gpu']['name']} | power {fp['gpu']['power.limit']} of "
+              f"{fp['gpu']['power.default_limit']} W | clocks.max.sm {fp['gpu']['clocks.max.sm']} "
+              f"| driver {fp['gpu']['driver_version']} -> {out}")
+        return
 
     results = {"repeats": [], "timings": timings}
 
@@ -738,8 +766,29 @@ def settled_check(windows, seconds=None, telemetry=None, batches=10):
         "temp_c_max": tel.get("temp_c_max"),
         "power_cap_frac": thr.get("power_cap"),
         "thermal_frac": thr.get("thermal"),
+        "sm_decline_pct": tel.get("sm_decline_pct"),
+        "clock_temp_corr": tel.get("clock_temp_corr"),
+        "limit": limit_reading(tel),
         "verdict": "settled" if flat else "still moving: do not rate this run",
     }
+
+
+def limit_reading(tel):
+    """Which limit actually shaped this run, read from clocks rather than flags."""
+    thr = (tel or {}).get("throttle_fraction", {}) or {}
+    dec, corr = tel.get("sm_decline_pct"), tel.get("clock_temp_corr")
+    pw, th = thr.get("power_cap"), thr.get("thermal")
+    if dec is None:
+        return "unknown: no telemetry"
+    if th and th > 0.05:
+        return "thermal throttling, flagged"
+    if dec > 2 and corr is not None and corr < -0.5:
+        return ("thermally mediated under a power cap: clock fell "
+                f"{dec:.1f}% as the card warmed, correlation {corr:.2f}, "
+                "and no thermal flag was ever set")
+    if pw and pw > 0.5:
+        return f"power capped, clock stable ({dec:.1f}% decline)"
+    return f"neither limit dominant ({dec:.1f}% clock decline)"
 
 
 STATES = ("cold", "warm", "recooled")
@@ -904,7 +953,12 @@ def cmd_analyze(args):
             w, s = g.get("window_tflops"), g.get("window_seconds")
             if not w:
                 continue
-            state, tel = rep_state(rep), g.get("telemetry", {})
+            # Prefer the raw telemetry CSV over the summary stored at run time: the CSVs
+            # are the source of truth, so any later analysis improvement applies
+            # retroactively to runs already collected.
+            state = rep_state(rep)
+            tpath = run["dir"] / f"telemetry_gemm_r{rep['repeat']}.csv"
+            tel = summarize_telemetry(tpath) if tpath.exists() else g.get("telemetry", {})
             common = {"sku": sku, "provider": fp["provider"], "run": run["dir"].name,
                       "repeat": rep["repeat"], "state": state, "price": fp.get("price_per_hr")}
             for name, warm in estimators:
@@ -976,8 +1030,9 @@ def cmd_analyze(args):
                     f"{fmt(med(es), 2)} | {fmt(max(es) if es else None, 2)} | "
                     f"{sum(1 for r in done if not r['within_tol'])} |")
         lines += ["", "| SKU | run | rep | second-half trend %/min | trend t | SM MHz mean/min | "
-                  "power W | temp C | power-cap frac | thermal frac | verdict |",
-                  "|" + "---|" * 11]
+                  "power W | temp C | power-cap frac | thermal frac | clock decline % | "
+                  "clock/temp corr | which limit | verdict |",
+                  "|" + "---|" * 14]
         for r in stops:
             sc = r.get("settled") or {}
             lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | "
@@ -985,7 +1040,9 @@ def cmd_analyze(args):
                          f"{fmt(sc.get('trend_t'), 2)} | {fmt(sc.get('sm_mhz_mean'), 0)}/"
                          f"{fmt(sc.get('sm_mhz_min'), 0)} | {fmt(sc.get('power_w_mean'), 0)} | "
                          f"{fmt(sc.get('temp_c_max'), 0)} | {fmt(sc.get('power_cap_frac'), 2)} | "
-                         f"{fmt(sc.get('thermal_frac'), 2)} | {sc.get('verdict', 'n/a')} |")
+                         f"{fmt(sc.get('thermal_frac'), 2)} | {fmt(sc.get('sm_decline_pct'), 1)} | "
+                         f"{fmt(sc.get('clock_temp_corr'), 2)} | {sc.get('limit', 'n/a')} | "
+                         f"{sc.get('verdict', 'n/a')} |")
         lines += ["", "The stopping rule is a candidate, not a verdict. It judges only the last "
                   f"{args.stop_window:g} s, so it has no power against drift slower than roughly "
                   "the per-window noise divided by that span: on the control case of a card "
@@ -1196,6 +1253,9 @@ def main():
     r.add_argument("--cooldown", type=float, default=0.0,
                    help="idle this many minutes after the repeats, then run one more "
                         "(cold-again): separates a thermal cold penalty from a software one")
+    r.add_argument("--fingerprint-only", action="store_true",
+                   help="record the configuration fingerprint and exit, for surveying what a "
+                        "host actually provides without paying for a benchmark")
     r.add_argument("--instance-start", default=None,
                    help="unix time or ISO timestamp at which you launched the instance, "
                         "so the summary can price provisioning overhead, not just test time")
