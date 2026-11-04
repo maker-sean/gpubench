@@ -853,7 +853,15 @@ def clock_budget(tel, boost_mhz):
         return None
     lo, hi = (tel.get("sm_mhz_per_degc_ci") or [None, None])
     slope = tel.get("sm_mhz_per_degc")
-    measurable = lo is not None and hi is not None and lo * hi > 0
+    # A slope needs a wide enough loaded temperature range to mean anything. A 600 s run
+    # spans only a few degrees, and the fit then picks up the startup ramp instead: one such
+    # run produced a positive slope, clock rising as the card warms, with an interval that
+    # excluded zero. This threshold was set AFTER seeing that result and is applied to every
+    # run, including the ones already collected. Disclosed rather than applied selectively.
+    rng0 = tel.get("temp_loaded_range") or [None, None]
+    span = (rng0[1] - rng0[0]) if (rng0[0] is not None and rng0[1] is not None) else None
+    wide_enough = span is not None and span >= MIN_SLOPE_TEMP_SPAN_C
+    measurable = (lo is not None and hi is not None and lo * hi > 0 and wide_enough)
     cool, floor_src = tel.get("sm_mhz_at_idle_temp"), tel.get("sm_mhz_coolest_loaded")
     rng = tel.get("temp_loaded_range") or [None, None]
     return {
@@ -873,8 +881,12 @@ def clock_budget(tel, boost_mhz):
         "mhz_per_degc": slope,
         "pct_of_boost_per_degc": slope / boost * 100 if slope is not None else None,
         "pct_per_degc_ci": [x / boost * 100 for x in (lo, hi)] if measurable else None,
-        "temp_sensitivity": ("measurable" if measurable else
-                             "not distinguishable from zero in this data"),
+        "loaded_temp_span_c": span,
+        "temp_sensitivity": (
+            "measurable" if measurable else
+            f"range too narrow ({span:.0f} C < {MIN_SLOPE_TEMP_SPAN_C:g} C required)"
+            if span is not None and not wide_enough else
+            "not distinguishable from zero in this data"),
         "loaded_temp_range_c": rng, "temp_bins": tel.get("temp_bins"),
         "extrapolated_degc_beyond_data": (rng[0] - tel["temp_c_idle"])
         if (rng[0] is not None and tel.get("temp_c_idle") is not None) else None,
@@ -898,6 +910,9 @@ def limit_reading(tel):
         return f"power capped, clock stable ({dec:.1f}% decline)"
     return f"neither limit dominant ({dec:.1f}% clock decline)"
 
+
+# Minimum loaded temperature span for a clock-temperature slope to be reported as real.
+MIN_SLOPE_TEMP_SPAN_C = 15.0
 
 STATES = ("cold", "warm", "recooled")
 
