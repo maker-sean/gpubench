@@ -60,22 +60,34 @@ The first two are **oracles**. They use the complete run to say what the shortes
 test *would have been*, which nobody can know while a test is running. They are lower bounds,
 useful for showing how much room exists, not candidate rules.
 
-The sequential rule is **causal**: at each second it looks only at the past. It stops when the
-95% confidence interval on the last `--stop-window` seconds is narrower than the tolerance and
-the least-squares trend across that window is under `--stop-drift`, for `--stop-confirm`
-consecutive checks. The interval is built from batch means rather than raw per-second samples,
-because consecutive seconds on a heating GPU are correlated and a naive standard error would
-claim confidence the data does not support.
+The sequential rule is **causal**: at each second it looks only at the past, and stops when
+two things hold together for `--stop-confirm` consecutive checks.
 
-Two consequences worth knowing before reading any result:
+- **Precise.** The 95% confidence interval on the mean of the last `--stop-window` seconds is
+  inside the tolerance. It is built from batch means rather than raw per-second samples,
+  because consecutive seconds on one GPU are correlated and a naive standard error would claim
+  confidence the data does not support.
+- **Settled.** The trend across that window is not statistically distinguishable from zero.
 
-- A rule that needs `--stop-window` seconds of data cannot return an answer sooner than that.
-  On a fast settling SKU the oracle length is therefore unattainable, and the shortest
-  defensible test is set by how long it takes to *prove* convergence, not by how long the card
-  takes to converge.
-- `analyze` reports the **realized error** at the stop, measured against the full-run
-  reference. A rule that stops quickly but lands outside tolerance is worse than a slow one.
-  That count is reported as "stopped early" and in the data quality flags.
+Neither check asks how long the answer will stay true. An earlier version of this rule
+projected the window trend forward over a horizon and refused to rate a card whose answer
+might move. That was a mistake worth recording: on a flat card the projection is a noisy slope
+multiplied by the horizon, so it inflates with the length of the promise rather than with
+anything the hardware did, and it made the stop time swing by a factor of two on the choice of
+batch count. **You cannot certify stability over a horizon longer than you observed.**
+Durability is a repeat-measurement question, not a longer-run one.
+
+### The stopping rule is a candidate, not a verdict
+
+The rule reads only the last `--stop-window` seconds, so it has no power against drift slower
+than roughly the per-window noise divided by that span. On a control case of a card sliding 8%
+across its run it stops at 61 s and is 7.3% wrong.
+
+`analyze` therefore also runs a **whole-run settled check** on every repeat, using every
+sample: a trend test on the second half of the throughput series, reported next to clock,
+power, temperature and throttle fractions from telemetry. That check catches the same control
+case at t=104. A rating is defensible only when both agree, and `analyze` flags any run where
+the rule fired but the whole run is still moving.
 
 ## Setup (on each instance)
 

@@ -616,30 +616,42 @@ def t_crit(df):
     return 1.96
 
 
-def sequential_stop(windows, seconds=None, tol=2.0, window_s=60.0, batches=6,
-                    confirm=2, horizon_s=600.0):
-    """A stopping rule a certification service could actually deploy.
+def _trend(ts, vals):
+    """OLS slope of vals on ts, its standard error, and |t| statistic.
 
-    The two t_converge estimators are oracles: they are the shortest test that would
-    have worked, computed with hindsight from the whole run. Nobody can run them live.
-    This rule looks only at the past. At each second it checks the last `window_s`
-    seconds and stops when both conditions hold for `confirm` consecutive checks:
+    Returned as a hypothesis test, not an extrapolation. "I cannot detect a trend"
+    is a claim the data supports. "I project 1.8% of drift over the next ten minutes"
+    is a noisy slope multiplied by a horizon, which inflates with the promise rather
+    than with anything the card did. The earlier rule made that mistake.
+    """
+    n = len(ts)
+    if n < 3:
+        return 0.0, 0.0, 0.0
+    mt, mv = statistics.mean(ts), statistics.mean(vals)
+    den = sum((t - mt) ** 2 for t in ts)
+    if not den:
+        return 0.0, 0.0, 0.0
+    slope = sum((t - mt) * (v - mv) for t, v in zip(ts, vals)) / den
+    resid = [v - (mv + slope * (t - mt)) for t, v in zip(ts, vals)]
+    sse = sum(r * r for r in resid)
+    se = (sse / (n - 2) / den) ** 0.5 if n > 2 and sse > 0 else 0.0
+    return slope, se, (abs(slope) / se if se else 0.0)
 
-      precision  the 95% confidence interval on the mean of that window is narrower
-                 than tol% of it. The interval is built from batch means, not from raw
-                 per-second samples, because consecutive seconds on a heating GPU are
-                 correlated and a naive standard error would claim confidence the data
-                 does not support.
-      durability the least-squares trend across that window, projected forward over
-                 `horizon_s`, moves the answer by less than tol%. Local flatness alone is
-                 not enough: a card drifting slowly looks flat across any 60 s you choose
-                 while still sitting far from where it ends up, and a card drifting
-                 linearly never settles at all. Projecting the trend is what separates
-                 "quiet right now" from "still true in ten minutes", and it is the only
-                 criterion here that refuses to rate a card that is still moving.
 
-    Returns the stop time, the estimate at that moment, and the realized error against
-    the full-run reference, which is how you find out whether the rule stops too early.
+def sequential_stop(windows, seconds=None, tol=2.0, window_s=60.0, batches=6, confirm=2):
+    """A stopping rule with two checks and no extrapolation.
+
+    At each second, looking only at the last `window_s` seconds of the past:
+      precise  the 95% confidence interval on the mean is inside tol%. Built from
+               batch means, because consecutive seconds on one GPU are correlated
+               and a naive standard error would claim confidence the data lacks.
+      settled  the trend across that window is not statistically distinguishable
+               from zero at 95%.
+
+    Both must hold for `confirm` consecutive checks. Neither asks how long the
+    answer will remain true: you cannot certify stability over a horizon longer
+    than you observed, and pretending otherwise just multiplies noise by the
+    promise. Durability is a repeat-measurement question, not a longer-run one.
     """
     n = len(windows or [])
     if n < 20:
@@ -647,22 +659,20 @@ def sequential_stop(windows, seconds=None, tol=2.0, window_s=60.0, batches=6,
     if not seconds or len(seconds) != n:
         seconds = [1.0] * n
     end, acc = [], 0.0
-    for s in seconds:
-        acc += s
+    for x in seconds:
+        acc += x
         end.append(acc)
     tail = [w for w, e in zip(windows, end) if e >= 0.75 * acc]
     ref = statistics.median(tail or windows)
     if not ref:
         return None
-    base = {"reference_tflops": ref, "window_s": window_s, "batches": batches,
-            "horizon_s": horizon_s}
+    base = {"reference_tflops": ref, "window_s": window_s, "batches": batches}
     tc, streak = t_crit(batches - 1), 0
 
     for i in range(n):
         if end[i] < window_s:
             continue
-        lo = end[i] - window_s
-        idx = [j for j in range(i + 1) if end[j] > lo]
+        idx = [j for j in range(i + 1) if end[j] > end[i] - window_s]
         if len(idx) < batches * 3:
             continue
         vals = [windows[j] for j in idx]
@@ -674,28 +684,62 @@ def sequential_stop(windows, seconds=None, tol=2.0, window_s=60.0, batches=6,
         bm = [statistics.mean(vals[k * b:(k + 1) * b]) for k in range(batches)]
         bt = [statistics.mean(ts[k * b:(k + 1) * b]) for k in range(batches)]
         hw_pct = tc * statistics.stdev(bm) / (batches ** 0.5) / m * 100
+        slope, _se, tstat = _trend(bt, bm)
 
-        # Trend on the batch means, carried out to the horizon as an upper confidence
-        # bound rather than a point estimate. A slope read off one short window is itself
-        # noisy, and projecting a noisy slope forward multiplies that noise by the
-        # horizon, so a point estimate would pass by luck on a card that is still moving.
-        mb, mt = statistics.mean(bm), statistics.mean(bt)
-        den = sum((t - mt) ** 2 for t in bt)
-        slope = (sum((t - mt) * (v - mb) for t, v in zip(bt, bm)) / den) if den else 0.0
-        resid = [v - (mb + slope * (t - mt)) for t, v in zip(bt, bm)]
-        se = ((sum(r * r for r in resid) / (batches - 2) / den) ** 0.5
-              if batches > 2 and den else 0.0)
-        drift_pct = (abs(slope) + t_crit(batches - 2) * se) * horizon_s / m * 100
-
-        streak = streak + 1 if (hw_pct <= tol and drift_pct <= tol) else 0
+        streak = streak + 1 if (hw_pct <= tol and tstat < t_crit(batches - 2)) else 0
         if streak >= confirm:
             err = abs(m - ref) / ref * 100
             return dict(base, stopped=True, t_stop_s=end[i], estimate_tflops=m,
-                        ci_halfwidth_pct=hw_pct, projected_drift_pct=drift_pct,
+                        ci_halfwidth_pct=hw_pct, trend_t=tstat,
+                        trend_pct_per_min=slope * 60 / m * 100,
                         realized_error_pct=err, within_tol=err <= tol)
     return dict(base, stopped=False, t_stop_s=None, estimate_tflops=None,
-                ci_halfwidth_pct=None, projected_drift_pct=None, realized_error_pct=None,
-                within_tol=False)
+                ci_halfwidth_pct=None, trend_t=None, trend_pct_per_min=None,
+                realized_error_pct=None, within_tol=False)
+
+
+def settled_check(windows, seconds=None, telemetry=None, batches=10):
+    """Was this run settled enough to be scored at all? Judged after the fact.
+
+    Two independent readings, so neither has to carry the verdict alone: a trend
+    test on the second half of the throughput series, and clock and power stability
+    from telemetry. A run that fails this should not produce a rating whatever the
+    stopping rule said.
+    """
+    n = len(windows or [])
+    if n < 40:
+        return None
+    if not seconds or len(seconds) != n:
+        seconds = [1.0] * n
+    end, acc = [], 0.0
+    for x in seconds:
+        acc += x
+        end.append(acc)
+    half = [(e, w) for w, e in zip(windows, end) if e >= 0.5 * acc]
+    vals = [w for _e, w in half]
+    ts = [e for e, _w in half]
+    m = statistics.mean(vals)
+    b = max(len(vals) // batches, 1)
+    bm = [statistics.mean(vals[k * b:(k + 1) * b]) for k in range(batches)]
+    bt = [statistics.mean(ts[k * b:(k + 1) * b]) for k in range(batches)]
+    slope, _se, tstat = _trend(bt, bm)
+    pct_per_min = slope * 60 / m * 100 if m else None
+    flat = tstat < t_crit(batches - 2)
+
+    tel = telemetry or {}
+    thr = tel.get("throttle_fraction", {}) or {}
+    return {
+        "second_half_trend_pct_per_min": pct_per_min,
+        "trend_t": tstat,
+        "throughput_flat": flat,
+        "sm_mhz_mean": tel.get("sm_mhz_mean"),
+        "sm_mhz_min": tel.get("sm_mhz_min"),
+        "power_w_mean": tel.get("power_w_mean"),
+        "temp_c_max": tel.get("temp_c_max"),
+        "power_cap_frac": thr.get("power_cap"),
+        "thermal_frac": thr.get("thermal"),
+        "verdict": "settled" if flat else "still moving: do not rate this run",
+    }
 
 
 STATES = ("cold", "warm", "recooled")
@@ -882,10 +926,10 @@ def cmd_analyze(args):
                     thermal_frac=tel.get("throttle_fraction", {}).get("thermal"),
                     membw=(rep.get("membw") or {}).get("median_gbps")))
             sr = sequential_stop(w, s, tol=args.tol, window_s=args.stop_window,
-                                 batches=args.stop_batches, confirm=args.stop_confirm,
-                                 horizon_s=args.stop_horizon)
+                                 batches=args.stop_batches, confirm=args.stop_confirm)
+            sc = settled_check(w, s, tel)
             if sr:
-                stops.append(dict(common, **sr))
+                stops.append(dict(common, settled=sc, **sr))
 
     lines = ["# gpubench summary", "",
              f"Tolerance {args.tol:g}%. Benchmark length is total wall time on the GPU, "
@@ -909,11 +953,11 @@ def cmd_analyze(args):
 
     lines += ["## 2. Causal: a sequential stopping rule you could ship", "",
               f"Stops when the 95% confidence interval on the last {args.stop_window:g} s "
-              f"(batch means, {args.stop_batches} batches) is under {args.tol:g}% and the "
-              f"trend across that window projected {args.stop_horizon:g} s forward moves the "
-              f"answer by less than {args.tol:g}%, for {args.stop_confirm} consecutive checks. "
-              "The projection is what refuses to rate a card that is still drifting, which "
-              "local flatness cannot detect.", ""]
+              f"(batch means, {args.stop_batches} batches) is under {args.tol:g}% and "
+              f"the trend across it is not distinguishable from zero at 95%, for "
+              f"{args.stop_confirm} consecutive checks. No extrapolation: you cannot certify "
+              "stability over a horizon longer than you observed, so durability is a "
+              "repeat-measurement question, not a longer-run one.", ""]
     if stops:
         lines += ["| SKU | state | runs | stopped | median stop s | worst stop s | "
                   "median realized error % | worst realized error % | stopped early (over tol) |",
@@ -931,13 +975,28 @@ def cmd_analyze(args):
                     f"{fmt(max([r['t_stop_s'] for r in done]) if done else None)} | "
                     f"{fmt(med(es), 2)} | {fmt(max(es) if es else None, 2)} | "
                     f"{sum(1 for r in done if not r['within_tol'])} |")
-        lines += ["", f"The rule cannot return an answer before {args.stop_window:g} s, because "
-                  "that is how long it takes to demonstrate precision. On a fast-settling SKU "
-                  "the oracle length is therefore unattainable: the shortest defensible test is "
-                  "set by how long it takes to prove convergence, not by how long the card takes "
-                  "to converge. 'Stopped early' counts runs where the rule fired but the answer "
-                  "was outside tolerance; those are false confidence and matter more than "
-                  "a slow stop.", ""]
+        lines += ["", "| SKU | run | rep | second-half trend %/min | trend t | SM MHz mean/min | "
+                  "power W | temp C | power-cap frac | thermal frac | verdict |",
+                  "|" + "---|" * 11]
+        for r in stops:
+            sc = r.get("settled") or {}
+            lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | "
+                         f"{fmt(sc.get('second_half_trend_pct_per_min'), 4)} | "
+                         f"{fmt(sc.get('trend_t'), 2)} | {fmt(sc.get('sm_mhz_mean'), 0)}/"
+                         f"{fmt(sc.get('sm_mhz_min'), 0)} | {fmt(sc.get('power_w_mean'), 0)} | "
+                         f"{fmt(sc.get('temp_c_max'), 0)} | {fmt(sc.get('power_cap_frac'), 2)} | "
+                         f"{fmt(sc.get('thermal_frac'), 2)} | {sc.get('verdict', 'n/a')} |")
+        lines += ["", "The stopping rule is a candidate, not a verdict. It judges only the last "
+                  f"{args.stop_window:g} s, so it has no power against drift slower than roughly "
+                  "the per-window noise divided by that span: on the control case of a card "
+                  "sliding 8% across a run, it stops at 61 s and is 7.3% wrong. The whole-run "
+                  "check above uses every sample and catches that case at t=104. A rating is "
+                  "only defensible when both agree.", ""]
+        lines += ["", f"The rule cannot answer before {args.stop_window:g} s, since that is the "
+                  "span the precision test reads. Where an oracle converges faster than that, the "
+                  "floor is the statistics rather than the silicon, and it is a cheap floor. "
+                  "'Stopped early' counts runs where the rule fired but the answer was outside "
+                  "tolerance; those are false confidence and matter more than a slow stop.", ""]
     else:
         lines += ["No run was long enough to evaluate the stopping rule.", ""]
 
@@ -1073,10 +1132,15 @@ def cmd_analyze(args):
         if r["bias60"] is None:
             flags.append(f"- {tag}: shorter than 60 s, no 60s bias available")
     for r in stops:
+        sc = r.get("settled") or {}
+        if r["stopped"] and sc.get("verdict", "").startswith("still moving"):
+            flags.append(f"- {r['sku']} {r['run']} rep {r['repeat']}: the stopping rule fired but "
+                         f"the whole run is still moving ({fmt(sc.get('second_half_trend_pct_per_min'), 4)}"
+                         "%/min, t=" + fmt(sc.get("trend_t"), 1) + "). Do not rate this run.")
         if r["stopped"] and not r["within_tol"]:
             flags.append(f"- {r['sku']} {r['run']} rep {r['repeat']}: the stopping rule fired at "
                          f"{r['t_stop_s']:.0f} s but was {r['realized_error_pct']:.1f}% off. "
-                         "False confidence: lengthen --stop-horizon or widen --stop-window.")
+                         "False confidence: widen --stop-window or raise --stop-batches.")
         if not r["stopped"]:
             flags.append(f"- {r['sku']} {r['run']} rep {r['repeat']}: the stopping rule never "
                          "fired within the run")
@@ -1097,7 +1161,7 @@ def cmd_analyze(args):
     Path(args.dir, "summary.json").write_text(json.dumps(
         {"tol": args.tol, "warmup": args.warmup, "fleet": args.fleet, "estimators": names,
          "stop_rule": {"window_s": args.stop_window, "batches": args.stop_batches,
-                       "confirm": args.stop_confirm, "horizon_s": args.stop_horizon},
+                       "confirm": args.stop_confirm},
          "runs": per_run, "stops": stops, "overhead_by_sku": ovh, "instances": inst}, indent=2))
     with open(Path(args.dir, "convergence.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -1155,16 +1219,13 @@ def main():
                    help="seconds the second estimator discards as warm-up")
     a.add_argument("--fleet", type=int, default=10000,
                    help="fleet size for the cost-to-certify figures")
-    a.add_argument("--stop-window", type=float, default=180.0,
+    a.add_argument("--stop-window", type=float, default=60.0,
                    help="seconds of recent data the sequential rule judges. Shorter windows "
                         "cannot estimate the trend precisely enough to project it")
     a.add_argument("--stop-batches", type=int, default=6,
                    help="batches used for the confidence interval, to handle autocorrelation")
     a.add_argument("--stop-confirm", type=int, default=2,
                    help="consecutive passing checks before the rule stops")
-    a.add_argument("--stop-horizon", type=float, default=600.0,
-                   help="seconds ahead the window trend is projected; the rule will not rate "
-                        "a card whose answer is projected to move more than --tol over it")
     a.set_defaults(func=cmd_analyze)
 
     args = p.parse_args()
