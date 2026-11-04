@@ -252,20 +252,32 @@ def summarize_telemetry(path):
     # reported reason stays SwPowerCap throughout. Branching on thermal_fraction alone would
     # call such a card thermally unaffected.
     # Clock loss splits into two parts with different time constants. The power cap bites
-    # the instant the kernel starts; heat builds over minutes. They are not separable by
-    # watching the clock alone, because no card is ever both loaded and cold, so regress
-    # clock on temperature across loaded samples and read off the idle temperature.
-    mhz_per_c = at_idle = None
+    # the instant the kernel starts; heat builds over minutes. Regressing clock on
+    # temperature across raw 500 ms samples overstates confidence badly, because
+    # consecutive samples are nearly identical: on one card that produced a slope of the
+    # wrong sign with a standard error small enough to look significant. Bin the loaded
+    # samples by whole degrees first, so the regression sees one point per temperature.
+    mhz_per_c = mhz_per_c_lo = mhz_per_c_hi = at_idle = coolest_loaded = None
+    t_lo = t_hi = n_bins = None
     if len(power) == len(sm) == len(temp) and len(sm) > 20 and max(power) > 0:
         thresh = 0.9 * max(power)
-        ls = [(a, b) for a, b, c in zip(sm, temp, power) if c > thresh]
-        if len(ls) > 10:
-            lt = [b for _a, b in ls]
-            lsm = [a for a, _b in ls]
-            mt, ms = statistics.mean(lt), statistics.mean(lsm)
-            den = sum((t - mt) ** 2 for t in lt)
-            if den and max(lt) - min(lt) > 2:
-                mhz_per_c = sum((t - mt) * (v - ms) for t, v in zip(lt, lsm)) / den
+        bins = {}
+        for a, b, c in zip(sm, temp, power):
+            if c > thresh:
+                bins.setdefault(round(b), []).append(a)
+        bt = sorted(bins)
+        if len(bt) >= 5:
+            bs = [statistics.mean(bins[b]) for b in bt]
+            n_bins, t_lo, t_hi = len(bt), bt[0], bt[-1]
+            coolest_loaded = bs[0]
+            mt, ms = statistics.mean(bt), statistics.mean(bs)
+            sxx = sum((t - mt) ** 2 for t in bt)
+            if sxx:
+                mhz_per_c = sum((t - mt) * (v - ms) for t, v in zip(bt, bs)) / sxx
+                res = [v - (ms + mhz_per_c * (t - mt)) for t, v in zip(bt, bs)]
+                se = (sum(x * x for x in res) / (n_bins - 2) / sxx) ** 0.5 if n_bins > 2 else 0.0
+                h = t_crit(n_bins - 2) * se
+                mhz_per_c_lo, mhz_per_c_hi = mhz_per_c - h, mhz_per_c + h
                 at_idle = ms + mhz_per_c * (min(temp) - mt)
     q = max(len(sm) // 4, 1)
     q1, q4 = (statistics.mean(sm[:q]), statistics.mean(sm[-q:])) if sm else (None, None)
@@ -282,8 +294,12 @@ def summarize_telemetry(path):
         "sm_decline_pct": (q1 - q4) / q1 * 100 if q1 else None,
         "clock_temp_corr": corr,
         "sm_mhz_per_degc": mhz_per_c,
+        "sm_mhz_per_degc_ci": [mhz_per_c_lo, mhz_per_c_hi],
         "sm_mhz_at_idle_temp": at_idle,
+        "sm_mhz_coolest_loaded": coolest_loaded,
         "temp_c_idle": min(temp) if temp else None,
+        "temp_loaded_range": [t_lo, t_hi],
+        "temp_bins": n_bins,
         "sm_mhz_mean": statistics.mean(sm) if sm else None,
         "sm_mhz_min": min(sm) if sm else None,
         "power_w_mean": statistics.mean(power) if power else None,
@@ -798,19 +814,42 @@ def settled_check(windows, seconds=None, telemetry=None, batches=10):
 
 
 def clock_budget(tel, boost_mhz):
-    """Split the gap between boost clock and steady clock into cap and heat."""
+    """Split the gap between boost clock and steady clock into cap and heat.
+
+    Two heat figures, deliberately. The floor is measured: the coolest loaded sample we
+    actually saw, against steady state. The model extrapolates the clock-temperature fit
+    down to idle temperature, which is tens of degrees below anything observed and is only
+    as good as the linear fit. Quote the floor; offer the model with its range attached.
+    When the slope's confidence interval spans zero there is no measurable temperature
+    sensitivity, and the model figure is reported as None rather than as a small number.
+    """
     try:
         boost = float(boost_mhz)
     except (TypeError, ValueError):
         return None
-    cool, steady = tel.get("sm_mhz_at_idle_temp"), tel.get("sm_mhz_q4_mean")
-    if not boost or cool is None or steady is None:
+    steady = tel.get("sm_mhz_q4_mean")
+    if not boost or steady is None:
         return None
-    return {"boost_mhz": boost, "cool_under_load_mhz": cool, "steady_mhz": steady,
-            "lost_to_power_cap_pct": (boost - cool) / boost * 100,
-            "lost_to_heat_pct": (cool - steady) / boost * 100,
-            "steady_pct_of_boost": steady / boost * 100,
-            "mhz_per_degc": tel.get("sm_mhz_per_degc")}
+    lo, hi = (tel.get("sm_mhz_per_degc_ci") or [None, None])
+    slope = tel.get("sm_mhz_per_degc")
+    measurable = lo is not None and hi is not None and lo * hi > 0
+    cool, floor_src = tel.get("sm_mhz_at_idle_temp"), tel.get("sm_mhz_coolest_loaded")
+    rng = tel.get("temp_loaded_range") or [None, None]
+    return {
+        "boost_mhz": boost, "steady_mhz": steady,
+        "steady_pct_of_boost": steady / boost * 100,
+        "lost_to_power_cap_pct": (boost - cool) / boost * 100 if (cool and measurable) else None,
+        "heat_floor_pct": (floor_src - steady) / boost * 100 if floor_src else None,
+        "heat_model_pct": (cool - steady) / boost * 100 if (cool and measurable) else None,
+        "mhz_per_degc": slope,
+        "pct_of_boost_per_degc": slope / boost * 100 if slope is not None else None,
+        "pct_per_degc_ci": [x / boost * 100 for x in (lo, hi)] if measurable else None,
+        "temp_sensitivity": ("measurable" if measurable else
+                             "not distinguishable from zero in this data"),
+        "loaded_temp_range_c": rng, "temp_bins": tel.get("temp_bins"),
+        "extrapolated_degc_beyond_data": (rng[0] - tel["temp_c_idle"])
+        if (rng[0] is not None and tel.get("temp_c_idle") is not None) else None,
+    }
 
 
 def limit_reading(tel):
@@ -1086,17 +1125,23 @@ def cmd_analyze(args):
                   "Spec TFLOPS assume boost clock. The gap splits into a power cap, which "
                   "bites the instant the kernel starts, and heat, which builds over minutes. "
                   "Only the second part is what a short test misses.", "",
-                  "| SKU | run | rep | boost MHz | cool under load MHz | steady MHz | "
-                  "lost to power cap % | lost to heat % | MHz per degC | steady % of boost |",
-                  "|" + "---|" * 10]
+                  "| SKU | run | rep | boost MHz | steady MHz | steady % of boost | "
+                  "heat floor % (measured) | heat model % | % boost per degC | 95% CI | "
+                  "loaded temp range C | sensitivity |",
+                  "|" + "---|" * 12]
         for r in stops:
             cb = r.get("clock_budget")
             if not cb:
                 continue
+            ci = cb.get("pct_per_degc_ci")
+            cis = f"[{ci[0]:+.3f}, {ci[1]:+.3f}]" if ci else "spans zero"
+            rng = cb.get("loaded_temp_range_c") or [None, None]
             lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | {fmt(cb['boost_mhz'],0)} | "
-                         f"{fmt(cb['cool_under_load_mhz'],0)} | {fmt(cb['steady_mhz'],0)} | "
-                         f"{fmt(cb['lost_to_power_cap_pct'],1)} | {fmt(cb['lost_to_heat_pct'],1)} | "
-                         f"{fmt(cb['mhz_per_degc'],2)} | {fmt(cb['steady_pct_of_boost'],1)} |")
+                         f"{fmt(cb['steady_mhz'],0)} | {fmt(cb['steady_pct_of_boost'],1)} | "
+                         f"{fmt(cb['heat_floor_pct'],2)} | {fmt(cb['heat_model_pct'],2)} | "
+                         f"{fmt(cb['pct_of_boost_per_degc'],3)} | {cis} | "
+                         f"{rng[0]}-{rng[1]} ({cb.get('temp_bins')} bins) | "
+                         f"{cb['temp_sensitivity']} |")
         lines += ["", "| SKU | run | rep | second-half trend %/min | trend t | SM MHz mean/min | "
                   "power W | temp C | power-cap frac | thermal frac | clock decline % | "
                   "clock/temp corr | which limit | verdict |",
@@ -1168,6 +1213,51 @@ def cmd_analyze(args):
                 lines.append(f"- {run['dir'].name}: idled {cd['minutes']:g} min, temperature "
                              f"{fmt(t.get('temp_c_first'), 0)} C to {fmt(t.get('temp_c_last'), 0)} C")
         lines.append("")
+
+    # Within one heating curve temperature and elapsed time rise together, so a single
+    # cycle cannot say which drives the clock. A cooldown gives a second, independent
+    # heating curve. If both fall on the same clock-temperature line, temperature is the
+    # driver; if the second sits lower at the same temperature, something cumulative is.
+    lines += ["## 4b. Temperature or elapsed time?", ""]
+    pooled = []
+    for run in runs:
+        byst = {}
+        for rep in run["res"].get("repeats", []):
+            tp = run["dir"] / f"telemetry_gemm_r{rep['repeat']}.csv"
+            if tp.exists():
+                byst.setdefault(rep_state(rep), []).append(summarize_telemetry(tp))
+        if "cold" in byst and "recooled" in byst:
+            pooled.append((run, byst))
+    if not pooled:
+        lines += ["No run has both a cold and a cold-again repeat yet, so temperature and "
+                  "elapsed time remain confounded: within one heating curve they rise "
+                  "together. --cooldown produces the second curve that separates them.", ""]
+    else:
+        lines += ["| SKU | run | cycle | slope % boost/degC | 95% CI | clock at shared temp | "
+                  "loaded range C |", "|" + "---|" * 7]
+        for run, byst in pooled:
+            boost = to_float(run["fp"]["gpu"].get("clocks.max.sm"))
+            rngs = [t["temp_loaded_range"] for st in ("cold", "recooled") for t in byst[st]
+                    if t.get("temp_loaded_range")]
+            shared = (max(r[0] for r in rngs) + min(r[1] for r in rngs)) / 2 if rngs else None
+            for st in ("cold", "recooled"):
+                for t in byst[st]:
+                    sl, ci = t.get("sm_mhz_per_degc"), t.get("sm_mhz_per_degc_ci") or [None, None]
+                    rng = t.get("temp_loaded_range") or [None, None]
+                    at = None
+                    if sl is not None and shared is not None and t.get("sm_mhz_at_idle_temp") is not None:
+                        at = t["sm_mhz_at_idle_temp"] + sl * (shared - t["temp_c_idle"])
+                    cis = (f"[{ci[0]/boost*100:+.3f}, {ci[1]/boost*100:+.3f}]"
+                           if (ci[0] is not None and boost) else "n/a")
+                    lines.append(
+                        f"| {run['fp']['gpu']['name']} | {run['dir'].name} | {st} | "
+                        f"{fmt(sl / boost * 100 if (sl is not None and boost) else None, 3)} | "
+                        f"{cis} | {fmt(at, 0)} MHz at {fmt(shared, 0)} C | {rng[0]}-{rng[1]} |")
+        lines += ["", "Read it this way: if the two cycles predict the same clock at the same "
+                  "temperature, and their slope intervals overlap, the clock is tracking "
+                  "temperature rather than hours of running. If the cold-again cycle sits "
+                  "lower at the same temperature, something cumulative is at work and a "
+                  "certificate cannot be refreshed by letting the card rest.", ""]
 
     lines += ["## 5. Where the billed time actually goes", ""]
     ovh = overhead_section(runs, lines)
