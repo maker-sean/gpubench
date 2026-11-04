@@ -50,8 +50,13 @@ echo "=== 2. Software ==="
 if [ "$INSTALL" = 1 ]; then
   # vLLM first: it pins a compatible torch. Installing torch first then vllm
   # usually replaces the torch you just installed.
-  "$PY" -m pip install -q --upgrade pip
-  "$PY" -m pip install -q vllm || echo "WARN: vllm install failed, GEMM and bandwidth will still run"
+  # --break-system-packages: images that follow PEP 668 (the Runpod pytorch image does)
+  # mark their Python externally managed, and a plain pip install refuses. The only symptom
+  # downstream is ModuleNotFoundError at inference time, an hour into a paid run.
+  PIPFLAGS="--break-system-packages"
+  "$PY" -m pip install -q $PIPFLAGS --upgrade pip 2>/dev/null || PIPFLAGS=""
+  "$PY" -m pip install -q $PIPFLAGS vllm || echo "WARN: vllm install failed, GEMM and bandwidth will still run"
+  "$PY" -c "import vllm" 2>/dev/null || echo "WARN: vllm still not importable after install"
 fi
 "$PY" - <<'PYEOF'
 import platform
