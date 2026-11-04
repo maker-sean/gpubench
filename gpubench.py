@@ -251,6 +251,22 @@ def summarize_telemetry(path):
     # and the same watts buy fewer MHz. Nothing sets a thermal flag while that happens: the
     # reported reason stays SwPowerCap throughout. Branching on thermal_fraction alone would
     # call such a card thermally unaffected.
+    # Clock loss splits into two parts with different time constants. The power cap bites
+    # the instant the kernel starts; heat builds over minutes. They are not separable by
+    # watching the clock alone, because no card is ever both loaded and cold, so regress
+    # clock on temperature across loaded samples and read off the idle temperature.
+    mhz_per_c = at_idle = None
+    if len(power) == len(sm) == len(temp) and len(sm) > 20 and max(power) > 0:
+        thresh = 0.9 * max(power)
+        ls = [(a, b) for a, b, c in zip(sm, temp, power) if c > thresh]
+        if len(ls) > 10:
+            lt = [b for _a, b in ls]
+            lsm = [a for a, _b in ls]
+            mt, ms = statistics.mean(lt), statistics.mean(lsm)
+            den = sum((t - mt) ** 2 for t in lt)
+            if den and max(lt) - min(lt) > 2:
+                mhz_per_c = sum((t - mt) * (v - ms) for t, v in zip(lt, lsm)) / den
+                at_idle = ms + mhz_per_c * (min(temp) - mt)
     q = max(len(sm) // 4, 1)
     q1, q4 = (statistics.mean(sm[:q]), statistics.mean(sm[-q:])) if sm else (None, None)
     corr = None
@@ -265,6 +281,9 @@ def summarize_telemetry(path):
         "sm_mhz_q4_mean": q4,
         "sm_decline_pct": (q1 - q4) / q1 * 100 if q1 else None,
         "clock_temp_corr": corr,
+        "sm_mhz_per_degc": mhz_per_c,
+        "sm_mhz_at_idle_temp": at_idle,
+        "temp_c_idle": min(temp) if temp else None,
         "sm_mhz_mean": statistics.mean(sm) if sm else None,
         "sm_mhz_min": min(sm) if sm else None,
         "power_w_mean": statistics.mean(power) if power else None,
@@ -770,10 +789,28 @@ def settled_check(windows, seconds=None, telemetry=None, batches=10):
         "thermal_frac": thr.get("thermal"),
         "sm_decline_pct": tel.get("sm_decline_pct"),
         "sm_mhz_steady": tel.get("sm_mhz_q4_mean"),
+        "sm_mhz_per_degc": tel.get("sm_mhz_per_degc"),
+        "sm_mhz_at_idle_temp": tel.get("sm_mhz_at_idle_temp"),
         "clock_temp_corr": tel.get("clock_temp_corr"),
         "limit": limit_reading(tel),
         "verdict": "settled" if flat else "still moving: do not rate this run",
     }
+
+
+def clock_budget(tel, boost_mhz):
+    """Split the gap between boost clock and steady clock into cap and heat."""
+    try:
+        boost = float(boost_mhz)
+    except (TypeError, ValueError):
+        return None
+    cool, steady = tel.get("sm_mhz_at_idle_temp"), tel.get("sm_mhz_q4_mean")
+    if not boost or cool is None or steady is None:
+        return None
+    return {"boost_mhz": boost, "cool_under_load_mhz": cool, "steady_mhz": steady,
+            "lost_to_power_cap_pct": (boost - cool) / boost * 100,
+            "lost_to_heat_pct": (cool - steady) / boost * 100,
+            "steady_pct_of_boost": steady / boost * 100,
+            "mhz_per_degc": tel.get("sm_mhz_per_degc")}
 
 
 def limit_reading(tel):
@@ -986,7 +1023,9 @@ def cmd_analyze(args):
                                  batches=args.stop_batches, confirm=args.stop_confirm)
             sc = settled_check(w, s, tel)
             if sr:
-                stops.append(dict(common, settled=sc, **sr))
+                stops.append(dict(common, settled=sc,
+                                  clock_budget=clock_budget(tel, fp["gpu"].get("clocks.max.sm")),
+                                  **sr))
 
     rev = sh("git -C " + str(Path(__file__).resolve().parent) + " rev-parse --short HEAD") or "unversioned"
     dirty = " +uncommitted" if sh("git -C " + str(Path(__file__).resolve().parent)
@@ -1043,6 +1082,21 @@ def cmd_analyze(args):
                     f"{fmt(max([r['t_stop_s'] for r in done]) if done else None)} | "
                     f"{fmt(med(es), 2)} | {fmt(max(es) if es else None, 2)} | "
                     f"{sum(1 for r in done if not r['within_tol'])} |")
+        lines += ["", "## Where the clock went", "",
+                  "Spec TFLOPS assume boost clock. The gap splits into a power cap, which "
+                  "bites the instant the kernel starts, and heat, which builds over minutes. "
+                  "Only the second part is what a short test misses.", "",
+                  "| SKU | run | rep | boost MHz | cool under load MHz | steady MHz | "
+                  "lost to power cap % | lost to heat % | MHz per degC | steady % of boost |",
+                  "|" + "---|" * 10]
+        for r in stops:
+            cb = r.get("clock_budget")
+            if not cb:
+                continue
+            lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | {fmt(cb['boost_mhz'],0)} | "
+                         f"{fmt(cb['cool_under_load_mhz'],0)} | {fmt(cb['steady_mhz'],0)} | "
+                         f"{fmt(cb['lost_to_power_cap_pct'],1)} | {fmt(cb['lost_to_heat_pct'],1)} | "
+                         f"{fmt(cb['mhz_per_degc'],2)} | {fmt(cb['steady_pct_of_boost'],1)} |")
         lines += ["", "| SKU | run | rep | second-half trend %/min | trend t | SM MHz mean/min | "
                   "power W | temp C | power-cap frac | thermal frac | clock decline % | "
                   "clock/temp corr | which limit | verdict |",
