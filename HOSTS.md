@@ -1,83 +1,117 @@
 # Three L40S cards, three hosts: what the host sets and what it does not
 
 Three NVIDIA L40S cards, three different hosts on the same provider and tier, same 350 W
-power limit on every one, same harness, same bf16 GEMM, 600 s per repeat. Steady clock is
-the last-quarter mean; steady temperature is the end-of-run value.
+power limit on every one, same harness, same bf16 GEMM, 600 s or 1200 s per repeat. Steady
+clock and steady temperature are the mean over the final quarter of each repeat, taken from
+the raw 500 ms telemetry.
 
-| card | steady temps | temp spread | TFLOPS | repeat spread | mean |
+| card | steady temp, across repeats | temp spread | sustained TFLOPS | repeat spread | cold 60 s bias |
 |---|---|---|---|---|---|
-| A | 73–79 °C | 6 °C | 163.6–169.8 | **3.78%** | 165.4 |
-| B | 68 °C | 0 °C | 163.4–163.5 | **0.08%** | 163.4 |
-| C | 79–80 °C | 1 °C | 157.1–158.3 | **0.72%** | 157.9 |
+| A | 72.2–79.3 °C | **7.1 °C** | 163.6–169.9 | **3.85%** | +8.50% |
+| B | 68.0–68.0 °C | **0.0 °C** | 163.4–163.5 | **0.06%** | +2.71% |
+| C | 79.3–80.0 °C | **0.7 °C** | 157.1–158.2 | **0.70%** | +8.71% |
 
-Three findings fall out, and they are not the same finding.
+Four findings fall out, and they are not the same finding.
 
-## 1. Temperature sensitivity is a SKU property
+## 1. Per clock, the three cards are identical. Everything else is clock.
 
-Two of the three cards had a loaded temperature span wide enough to regress on (the 15 °C
-minimum this study applies), and they agree:
-
-| card | slope | 95% CI | loaded span |
+| card | sustained TFLOPS | steady SM clock | TFLOPS per MHz |
 |---|---|---|---|
-| B | **−0.205 %/°C** of boost | [−0.241, −0.169] | 17 °C |
-| C | **−0.217 %/°C** of boost | [−0.229, −0.205] | 30 °C |
+| A | 163.6 | 1163 MHz | **0.1407** |
+| B | 163.5 | 1162 MHz | **0.1407** |
+| C | 158.2 | 1125 MHz | **0.1406** |
 
-Different cards, different hosts, overlapping intervals. Within a card, clock falls with
-temperature at about a fifth of a percent per degree, and that number looks like a property
-of the L40S rather than of any one unit.
+Identical to four significant figures. Card C delivers 3.3% less than card A for exactly one
+reason: it holds 1125 MHz instead of 1163. 1125/1163 is 96.7%, and 158.2/163.6 is 96.7%.
 
-## 2. Across cards, temperature predicts nothing
+This is worth stating first because it says what a rating actually measures. No card in this
+study did less work per clock than another of its model. The spread between hosts is a clock
+measurement and nothing else, and clock is set by the power limit and the temperature — one
+of which is configuration and the other of which belongs to the building.
 
-The same slope that is solid within a card has no cross-card power at all:
+The same holds across the H100 variants: the NVL delivers 0.4996 TFLOPS/MHz against the
+SXM's 0.4982, or **100.3% of the SXM's work per clock**, while delivering 49% of its
+throughput. Measured against measured, no specification sheet required.
 
-- A and C both settle at **79 °C** and differ by **3.3%** (163.6 vs 158.2 on the cold repeat).
-- A and B are **11 °C apart** and deliver the **same throughput** (163.6 vs 163.5, 0.06%).
+## 2. Temperature sensitivity is similar in magnitude across cards, but not the same number
 
-Applied across units the slope predicts 2.3% for an 11 °C gap; observed is 0.06% for that
-pair and 3.3% for a pair with no gap at all. So a card's rating is set by something other
-than the temperature it runs at — unit-to-unit variation, host configuration, or both — and
-knowing a card's operating temperature does not let you infer its score.
+All three cards had a cold repeat whose loaded temperature span cleared the 15 °C minimum
+this study requires before reporting a slope:
 
-This is worth stating plainly because it is the error the obvious analysis makes. A
-within-unit slope with a tight confidence interval invites extrapolation across units, and
-on this data that extrapolation is wrong twice over: wrong in magnitude for one pair and
-wrong in sign-of-effect for the other.
+| card | slope, cold repeat | 95% CI | loaded span |
+|---|---|---|---|
+| A | **−0.171 %/°C** of boost | [−0.180, −0.161] | 35 °C (45–80) |
+| B | **−0.205 %/°C** of boost | [−0.241, −0.169] | 17 °C (51–68) |
+| C | **−0.217 %/°C** of boost | [−0.229, −0.205] | 30 °C (50–80) |
 
-## 3. Repeatability is a host property
+Every card loses roughly a fifth of a percent of boost per degree, so the effect is real and
+its order of magnitude is a property of the model. But the two cards measured over the widest
+spans, A and C, have **non-overlapping confidence intervals** — 27% apart in slope. Card B's
+interval is wide enough to overlap both, which is what a 17 °C span buys.
 
-What the host does control is whether the number is reproducible:
+So there is no single L40S number to apply. A temperature correction has to come from the
+card's own history, not from its model. An earlier revision of this document claimed the
+slopes agreed and reported only two of the three; that was wrong, and it was wrong because
+card A — the one that breaks it — was dropped from the table by a bad join.
+
+## 3. Across cards, temperature predicts nothing at all
+
+- A and C both settle at **79.3 °C** and differ by **3.3%** (163.6 vs 158.2 on the cold repeat).
+- A and B are **11.3 °C apart** and deliver the **same throughput** (163.6 vs 163.5, 0.06%).
+
+Applied across units, even the shallowest of the three slopes predicts about 1.9% for an
+11 °C gap; observed is 0.06% for that pair and 3.3% for a pair with no gap at all. Knowing a
+card's operating temperature tells you nothing about its score.
+
+This is the error the obvious analysis makes. A within-unit slope with a tight confidence
+interval invites extrapolation across units, and on this data that extrapolation is wrong
+twice over: wrong in magnitude for one pair and wrong in direction of effect for the other.
+
+## 4. The host contributes two independent things, and they are easy to confuse
+
+**How hot the host runs sets the cold-start bias.** The two cards that equilibrate at 79.3 °C
+read +8.50% and +8.71% high on a 60-second test — agreeing to a fifth of a point. The card
+that equilibrates at 68.0 °C reads +2.71%. The ramp a short test misses is the ramp to the
+host's own equilibrium, so a hot box has three times the cold bias of a cool one.
+
+**How steadily the host holds that temperature sets the repeatability.**
 
 | card | steady temp moved | rating varied |
 |---|---|---|
-| A | 6 °C | 3.78% |
-| B | 0 °C | 0.08% |
-| C | 1 °C | 0.72% |
+| A | 7.1 °C | 3.85% |
+| B | 0.0 °C | 0.06% |
+| C | 0.7 °C | 0.70% |
 
 Monotonic across all three. The card in the box that held temperature constant returned the
-same rating four times to within 0.08%, including after a ten-minute cooldown. The card in
-the box that let temperature wander 6 °C produced a 3.8% spread — larger than the 1.5%
-spread this study measured between two different H100s.
+same rating four times to within 0.06%, including after a ten-minute cooldown. The card in
+the box that let temperature wander 7 °C produced a 3.85% spread — larger than the 1.50%
+spread this study measured between two different H100 SXM cards.
 
-A card in a thermally unstable host is not certifiable to better than a few percent no
-matter how long the test runs, because the variance is in the host, not in the measurement
-window.
+These two properties are independent, which is the trap. Card C is the steadiest host in the
+set (0.7 °C, 0.70% spread) and also has the **largest** cold bias of any card measured
+(+8.71%), because it runs hottest. A host that gives you a highly reproducible number can
+still give you a badly biased one if the test is short, and a stability metric will not catch
+it.
 
 ## What this means for a certificate
 
-The three findings point at three different fields, and a score alone carries none of them:
+Four findings, four different fields, and a score alone carries none of them:
 
-- Because sensitivity is a SKU property, the **loaded temperature at which the score was
-  taken** must be recorded, or the number cannot be compared to another unit's.
-- Because temperature does not predict across units, **every unit has to be measured**. A
-  model-level rating adjusted for temperature will not reproduce what a buyer rents.
-- Because repeatability is a host property, the **spread across repeats** belongs on the
-  certificate beside the score. A single number from a 6 °C-wandering host and a single
-  number from a stable one look identical on paper and are not the same claim.
+- Because the spread between hosts is entirely clock, the **sustained clock as a percentage
+  of boost** is the one number that explains a rating, and it is cheap to record.
+- Because sensitivity varies by unit, the **loaded temperature at which the score was taken**
+  must be recorded, and **no cross-unit temperature adjustment should be offered**.
+- Because equilibrium temperature sets the cold bias, a certificate needs to show the test
+  reached steady state — not merely that it ran for a fixed time.
+- Because repeatability is a host property, the **spread across repeats** belongs beside the
+  score. A single number from a 7 °C-wandering host and a single number from a steady one
+  look identical on paper and are not the same claim.
 
 A fleet percentile such as an SM Score inherits all of this: it ranks units partly by the
 hosts they sat in. Card C, the slowest of the three, graded **D** — the bottom quartile —
-while running within 1 °C of perfectly steady. Its repeatability was excellent and its
-rating was still 3.5% below a sibling card in a cooler box.
+while running within 0.7 °C of perfectly steady. Its repeatability was excellent, its work
+per clock was identical to its siblings', and its rating was still 3.3% below card A in a
+different box.
 
 ## Caveats
 
@@ -85,9 +119,11 @@ rating was still 3.5% below a sibling card in a cooler box.
   is based on three points and should be read as a consistent pattern, not a fitted law.
 - Host assignment is not controllable on this provider, so "host" here bundles cooling,
   airflow, ambient temperature and neighbours into one unobserved variable.
-- Card A's repeats ran under an older harness revision that did not record last-quarter
-  clock, so its steady clocks are absent from the table; its temperatures and throughput
-  are directly comparable.
-- Card C was still drifting slowly downward at the end of two repeats (−0.14%/min and
-  −0.018%/min, both flagged by the harness's own settling check as "do not rate"). Its
+- Card A's four repeats include one at 169.9 TFLOPS and 72.2 °C that is the outlier driving
+  its 3.85% spread; the other three agree to 0.2%. The spread is reported as the range
+  because a certificate would have had to quote whichever repeat it happened to run.
+- Card C was still drifting slowly downward at the end of its two warm repeats (−0.14%/min
+  and −0.018%/min, both flagged by the harness's own settling check as "do not rate"). Its
   figures are reported with that flag attached rather than silently averaged.
+- Cards A and B ran 1200 s repeats; card C ran 600 s. Steady-state figures are taken from the
+  final quarter of each, so they are comparable, but card C had less time to drift.

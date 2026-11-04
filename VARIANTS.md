@@ -17,15 +17,26 @@ repeat), memory bandwidth, and — on two of the three — vLLM serving Qwen2.5-
 | H100 PCIe | 2.89 | 1755 | **310** / 310 / 350 | **gen4**/4 x16 | 349.8 | **1851** | 792 | 309 | 54 |
 
 Percentage of boost clock sustained: SXM 69%, NVL 38%, PCIe 45%.
+
+Per clock, the SXM and the NVL are the same card: 0.4982 against 0.4996 TFLOPS per MHz, or
+**100.3%** of the SXM's work per clock, while the NVL delivers 49% of its throughput. The
+NVL's entire shortfall is clock, and its clock is set by the 310 W limit. The PCIe part sits
+at 0.4417 TFLOPS/MHz, 88.7% of the SXM, consistent with its smaller SM count rather than
+with any configuration. No published specification is needed for either comparison; these
+are measured numbers divided by measured clocks.
+
 All three sat at 100% of their configured power limit for the whole run. None was
-thermally throttled. Every one of them is power-bound, and two of them are power-bound
-at a limit the host chose, not one the card requires.
+thermally throttled. Every one of them is power-bound, and two of them are power-bound at
+a limit well below what the card's own hardware permits.
 
 Two things here are invisible at purchase and are not in the price list:
 
 - **The NVL ships configured at 310 W against a 400 W maximum.** NVIDIA publishes a
-  350-400 W configurable range for this card. The host set it below that range. Datacenter
-  not recorded.
+  350-400 W configurable range for this card, so the configured limit is below the range the
+  vendor documents. Both NVL cards reported `power.limit` equal to `power.default_limit` at
+  310 W, so this is the state the card arrived in rather than a limit a host lowered at boot
+  — which makes it harder to find, not easier, since there is no deviation from default to
+  detect. Datacenter not recorded.
 - **The PCIe card is on a gen 4 link.** Its own `pcie.link.gen.max` reads 4, so this is a
   gen-4 part, but its measured bandwidth is 52% of the NVL's at a similar compute number.
 
