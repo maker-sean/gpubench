@@ -839,7 +839,12 @@ def clock_budget(tel, boost_mhz):
         "boost_mhz": boost, "steady_mhz": steady,
         "steady_pct_of_boost": steady / boost * 100,
         "lost_to_power_cap_pct": (boost - cool) / boost * 100 if (cool and measurable) else None,
-        "heat_floor_pct": (floor_src - steady) / boost * 100 if floor_src else None,
+        # Descriptive, no causal claim: the clock does fall after the first loaded sample,
+        # but on a card with no measurable temperature sensitivity that is a power-management
+        # transient, not heat. Only promote it to a heat figure when the slope excludes zero.
+        "clock_loss_after_first_loaded_pct": (floor_src - steady) / boost * 100 if floor_src else None,
+        "heat_floor_pct": ((floor_src - steady) / boost * 100
+                           if (floor_src and measurable) else None),
         "heat_model_pct": (cool - steady) / boost * 100 if (cool and measurable) else None,
         "mhz_per_degc": slope,
         "pct_of_boost_per_degc": slope / boost * 100 if slope is not None else None,
@@ -1126,9 +1131,10 @@ def cmd_analyze(args):
                   "bites the instant the kernel starts, and heat, which builds over minutes. "
                   "Only the second part is what a short test misses.", "",
                   "| SKU | run | rep | boost MHz | steady MHz | steady % of boost | "
-                  "heat floor % (measured) | heat model % | % boost per degC | 95% CI | "
+                  "clock loss after first loaded % | heat floor % | heat model % | "
+                  "% boost per degC | 95% CI | "
                   "loaded temp range C | sensitivity |",
-                  "|" + "---|" * 12]
+                  "|" + "---|" * 13]
         for r in stops:
             cb = r.get("clock_budget")
             if not cb:
@@ -1138,6 +1144,7 @@ def cmd_analyze(args):
             rng = cb.get("loaded_temp_range_c") or [None, None]
             lines.append(f"| {r['sku']} | {r['run']} | {r['repeat']} | {fmt(cb['boost_mhz'],0)} | "
                          f"{fmt(cb['steady_mhz'],0)} | {fmt(cb['steady_pct_of_boost'],1)} | "
+                         f"{fmt(cb['clock_loss_after_first_loaded_pct'],2)} | "
                          f"{fmt(cb['heat_floor_pct'],2)} | {fmt(cb['heat_model_pct'],2)} | "
                          f"{fmt(cb['pct_of_boost_per_degc'],3)} | {cis} | "
                          f"{rng[0]}-{rng[1]} ({cb.get('temp_bins')} bins) | "
