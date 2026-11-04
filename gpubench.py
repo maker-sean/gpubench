@@ -985,7 +985,18 @@ def cmd_analyze(args):
             if sr:
                 stops.append(dict(common, settled=sc, **sr))
 
+    rev = sh("git -C " + str(Path(__file__).resolve().parent) + " rev-parse --short HEAD") or "unversioned"
+    dirty = " +uncommitted" if sh("git -C " + str(Path(__file__).resolve().parent)
+                                  + " status --porcelain -- gpubench.py") else ""
     lines = ["# gpubench summary", "",
+             f"Produced by gpubench `{rev}{dirty}` on "
+             f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}. "
+             f"Settings: tol {args.tol:g}%, warmup {args.warmup:g}s, stop-window "
+             f"{args.stop_window:g}s, stop-batches {args.stop_batches}, stop-confirm "
+             f"{args.stop_confirm}, fleet {args.fleet}. Numbers are reproducible only "
+             "against this revision and these settings: the analysis re-derives telemetry "
+             "from the raw CSVs, so a later revision can legitimately change a published "
+             "figure.", "",
              f"Tolerance {args.tol:g}%. Benchmark length is total wall time on the GPU, "
              f"warm-up included. Fleet figures assume {args.fleet:,} GPUs.", "",
              "Three ways of turning a run into one number are compared. The first two are "
