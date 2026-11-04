@@ -135,7 +135,7 @@ GPU_FIELDS = [
 ]
 
 
-def fingerprint(gpu, target, provider, price, label, out_dir):
+def fingerprint(gpu, target, provider, price, label, out_dir, tier=None):
     import torch
     try:
         import vllm
@@ -159,6 +159,7 @@ def fingerprint(gpu, target, provider, price, label, out_dir):
     fp = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "provider": provider,
+        "cloud_tier": tier,  # secure vs community is a cooling-regime variable, not a billing one
         "price_per_hr": price,
         "label": label,
         "gpu_index": gpu,
@@ -384,7 +385,8 @@ def cmd_run(args):
 
     timings = {"instance_start": resolve_instance_start(args.instance_start),
                "process_start": t_proc, "first_window": None}
-    fp = fingerprint(args.gpu, target, args.provider, args.price_per_hr, args.label, out)
+    fp = fingerprint(args.gpu, target, args.provider, args.price_per_hr, args.label, out,
+                     tier=args.cloud_tier)
     timings["fingerprint_done"] = time.time()
     print(f"[gpubench] {fp['gpu']['name']} | driver {fp['gpu']['driver_version']} | "
           f"power limit {fp['gpu']['power.limit']} of {fp['gpu']['power.default_limit']} W | "
@@ -767,6 +769,7 @@ def settled_check(windows, seconds=None, telemetry=None, batches=10):
         "power_cap_frac": thr.get("power_cap"),
         "thermal_frac": thr.get("thermal"),
         "sm_decline_pct": tel.get("sm_decline_pct"),
+        "sm_mhz_steady": tel.get("sm_mhz_q4_mean"),
         "clock_temp_corr": tel.get("clock_temp_corr"),
         "limit": limit_reading(tel),
         "verdict": "settled" if flat else "still moving: do not rate this run",
@@ -1264,6 +1267,9 @@ def main():
     r.add_argument("--cooldown", type=float, default=0.0,
                    help="idle this many minutes after the repeats, then run one more "
                         "(cold-again): separates a thermal cold penalty from a software one")
+    r.add_argument("--cloud-tier", default=None,
+                   help="secure or community. Managed datacenters and individual hosts are "
+                        "different cooling regimes, which is what sets sustained clock")
     r.add_argument("--fingerprint-only", action="store_true",
                    help="record the configuration fingerprint and exit, for surveying what a "
                         "host actually provides without paying for a benchmark")
