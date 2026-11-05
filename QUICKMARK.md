@@ -3,8 +3,9 @@
 Measured 2026-11-04 on one NVIDIA L40S (third distinct card of this study), rented from
 Runpod Secure, host reporting location AU. Agent: the stable build from
 `downloads.silicondata.com/agent`, dated 2026-09-28, run unregistered with no account and
-no job key. Two QuickMark runs 30 minutes apart on the same card, one cold and one after a
-600 s GEMM soak, with the card sampled at 1 Hz throughout by an independent process.
+no job key. Three QuickMark runs on the same card over two hours — one cold, one after a
+600 s GEMM soak, and one after a ten-minute idle cooldown — with the card sampled at 1 Hz
+throughout by an independent process.
 
 ## Access
 
@@ -25,17 +26,26 @@ instrumentation.
 
 | run | card before the run | speed pass | thermal probe | SM Score |
 |---|---|---|---|---|
-| cold | 31 C, idle | 402 s | 702 s | **D** (scoring v1, QM v2.0) |
+| cold | 31 C, idle | 403 s | 702 s | **D** (scoring v1, QM v2.0) |
 | warm | 62 C, after a 600 s soak | 406 s | 699 s | **D** (scoring v1, QM v2.0) |
+| recooled | 30 C, after a 10 min idle | 399 s | 688 s | **D** (scoring v1, QM v2.0) |
 
 What the card was doing during the window that sets the score:
 
 | | n | mean clock | % of boost | mean temp | temp first → last | power | util |
 |---|---|---|---|---|---|---|---|
-| cold | 403 | 1475 MHz | 59% | 70.6 C | 31 → 66 | 312 W | 86% |
-| warm | 406 | 1463 MHz | 58% | 73.5 C | 48 → 66 | 313 W | 86% |
+| cold | 403 | 1475 MHz | 58.5% | 70.6 C | 31 → 66 | 312 W | 86% |
+| warm | 406 | 1463 MHz | 58.1% | 73.5 C | 48 → 66 | 313 W | 86% |
+| recooled | 399 | 1484 MHz | 58.9% | 69.3 C | 30 → 65 | 311 W | 86% |
 
-**Difference in mean clock between a cold and a warm start: +0.81%.**
+**Full range in mean clock across all three thermal states: 1.46%** (1463 to 1484 MHz).
+Cold against warm alone is +0.81%.
+
+The three runs order exactly as the physics predicts and the published grade ignores all of
+it. Starting temperature 30, 31 and 62 C produces mean scored-window clocks of 1484, 1475
+and 1463 MHz and mean temperatures of 69.3, 70.6 and 73.5 C — monotonic in both. So the
+effect is real, it is measurable at 1 Hz from outside the product, and it is 1.46% wide. A
+quartile letter cannot express 1.46%, which is why all three runs returned D.
 
 Minute by minute inside the scored window:
 
