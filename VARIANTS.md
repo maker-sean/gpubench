@@ -59,9 +59,11 @@ Read the rankings in order and they disagree with each other:
 - **Per output token**, the ranking inverts back: the NVL costs 45% more per token than
   the SXM.
 
-A buyer who picks on sticker price takes the PCIe card, which is the worst of the three on
-both measured axes. A buyer who picks on bandwidth takes the NVL and pays 45% more per
-token than if they had bought the card with the higher sticker price.
+A buyer who picks on sticker price takes the PCIe card, which has the least bandwidth of
+the three by a wide margin — 52% of the NVL's — while sitting between the other two on cost
+per unit of compute. A buyer who picks on bandwidth takes the NVL and pays 45% more per
+token than if they had bought the card with the higher sticker price. No single axis ranks
+these three the same way, which is the point.
 
 ## Why the bandwidth bargain does not survive contact with a real workload
 
