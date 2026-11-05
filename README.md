@@ -10,9 +10,23 @@ would have reported and how far off it would have been.
 Every run also captures a configuration fingerprint and 500 ms telemetry, so a difference
 between two machines of the same SKU can be attributed rather than just observed.
 
-> **Status: harness complete, measurement runs pending.** `results/` is empty until real
-> instances are benchmarked. No numbers in this repo are modeled, extrapolated or estimated;
-> anything published here will be reproducible from the raw data committed alongside it.
+> **Status: measurements complete.** Nine GPUs across four SKUs on Runpod, 2–4 November
+> 2026, plus a power-limit census of nine distinct cards sold as "H100". No number in this
+> repo is modeled, extrapolated or estimated, and every one is reproducible from the raw
+> data committed alongside it.
+
+**Read first: [MEMO.md](MEMO.md)** — the one-page result, with a table mapping every claim
+to the document that backs it.
+
+The findings, each standing on its own data:
+
+| Document | What it establishes |
+|---|---|
+| [HOSTS.md](HOSTS.md) | Three L40S in three hosts: per clock they are identical to 0.1%, so the spread between them is clock alone. Equilibrium temperature sets the short-test bias (8.50% / 8.71% / 2.71%); temperature *stability* sets repeatability (3.85% / 0.70% / 0.06%). The two are independent. |
+| [VARIANTS.md](VARIANTS.md) | Three cards catalogued as "H100" give three mutually inconsistent cost rankings. Two arrived configured at 310 W against a 400 W maximum, which is invisible in the price list and in the provider's API, and turns a 32% bandwidth discount into a 45% token premium. |
+| [CONVERGENCE.md](CONVERGENCE.md) | Required test length is not a SKU property. Under a deployable stopping rule the three H100 variants stop at the rule's 60 s floor; three L40S stop at 99 s, 365 s and 511 s. |
+| [QUICKMARK.md](QUICKMARK.md) | SiliconMark's own QuickMark, run cold, warm and recooled on one L40S. It graded D all three times — a real 1.46% clock range that a quartile letter cannot express. Includes a claim this study retracted after measuring it. |
+| [PREREGISTRATION.md](PREREGISTRATION.md) | Predictions committed to git before the runs that tested them. |
 
 ## What it measures
 

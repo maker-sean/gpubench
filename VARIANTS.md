@@ -101,6 +101,11 @@ before anyone rents one, which today they are not.
   a second NVL could well be configured at 400 W.
 - The inference test was run on two of the three variants; the PCIe card was acquired late
   and only received the GEMM and bandwidth pass.
+- The inference figures come from a different physical card of the same variant than the
+  GEMM and bandwidth figures above (a second SXM and a second NVL, both at the same power
+  limit as the first: 700 W and 310 W respectively). So the compute and token numbers are
+  variant-level results, not two measurements of one unit, and the 45% token premium rests
+  on the variants sharing a configuration rather than on a single card doing both tests.
 - Model load time (139 s vs 251 s) is a host storage and network property, not a GPU
   property, and is reported only to show it was not confused with serving throughput.
 - Tokens per dollar uses on-demand hourly price and excludes model load time, which a
